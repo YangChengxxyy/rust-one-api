@@ -225,6 +225,10 @@ impl QuotaChecker for CodexChecker {
         "codex"
     }
 
+    fn as_resetter(&self) -> Option<&dyn crate::provider_quota::types::QuotaResetter> {
+        Some(self)
+    }
+
     async fn check_quota(
         &self,
         http: &reqwest::Client,

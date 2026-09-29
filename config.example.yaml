@@ -1,0 +1,13 @@
+# rust-one-api 配置示例。所有字段可用环境变量覆盖：
+# ROA_LISTEN / ROA_DATABASE_URL / ROA_ADMIN_TOKEN；配置文件路径用 CONFIG_FILE 指定。
+
+listen: "0.0.0.0:3000"
+
+# sqlite://path 或 postgres://user:pass@host/db
+database_url: "sqlite://rust-one-api.db"
+
+# tracing env-filter
+log: "info"
+
+# 管理 API 的 Bearer token；不设置则 /admin/* 全部 403
+admin_token: "change-me"

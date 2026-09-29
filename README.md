@@ -61,8 +61,11 @@ Relay（`Authorization: Bearer` / `x-api-key` / `?key=`）：
 | `POST /v1/chat/completions` | OpenAI |
 | `POST /v1/messages`、`POST /anthropic/v1/messages` | Anthropic |
 | `POST /gemini/{ver}/models/{model}:{generateContent\|streamGenerateContent}` | Gemini |
+| `GET /v1/models` | 模型列表（enabled 渠道 supported_models ∪ model_mapping keys，去重排序） |
 
 Admin（`Authorization: Bearer $ROA_ADMIN_TOKEN`）：`/admin/channels`、`/admin/keys`、`/admin/prices`（CRUD），`/admin/usage`（用量查询），`/admin/quota`、`POST /admin/quota/check`（渠道配额）。
+
+计费说明：上游（流式或非流式）未返回 usage 时，网关按启发式估算 token 计费（ASCII ≈ 4 字符/token，CJK（≥ U+2E80）≈ 1 字符/token，每条消息 +3 开销），并打 `tracing::warn`（含 request_id）；usage_logs 无独立标记列。
 
 ## 数据约定
 

@@ -10,8 +10,9 @@ pub mod timeparse;
 pub mod types;
 
 use anyhow::Result;
-use chrono::{Duration as ChronoDuration, Utc};
-use futures::StreamExt;
+ use chrono::{Duration as ChronoDuration, Utc};
+ use futures::StreamExt;
+use crate::keystate;
 
 use crate::storage::{Channel, ChannelRepo, Db, ProviderQuotaRepo};
 use checkers::checker_for_channel;
@@ -119,7 +120,50 @@ pub fn spawn_scheduler(pool: Db, http: reqwest::Client) {
                 })
                 .buffer_unordered(8)
                 .collect::<Vec<_>>()
-                .await;
-        }
+                 .await;
+            // Recovery sweep: channels whose process-local auto-disable window
+            // (keystate) expired get one probe; a healthy quota status
+            // (available|warning) re-enables them, anything else re-arms the
+            // backoff with the next doubling window.
+            for channel_id in keystate::disabled_channels_expired() {
+                let ch = match ChannelRepo::get(&pool, &channel_id).await {
+                    Ok(Some(ch)) => ch,
+                    Ok(None) => {
+                        keystate::enable_channel(&channel_id);
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(channel = %channel_id, error = %e, "recovery sweep: channel fetch failed");
+                        continue;
+                    }
+                };
+                if ch.status != "enabled" {
+                    // Durable admin disable wins; drop the local disable.
+                    keystate::enable_channel(&channel_id);
+                    continue;
+                }
+                let healthy = match check_channel(&pool, &http, &ch).await {
+                    Err(e) => {
+                        tracing::warn!(channel = %ch.name, error = %e, "recovery sweep: probe failed");
+                        false
+                    }
+                    Ok(()) => match ProviderQuotaRepo::list_for_channel(&pool, &channel_id).await {
+                        Ok(rows) => rows.first().map(|r| r.status == "available" || r.status == "warning").unwrap_or(false),
+                        Err(e) => {
+                            tracing::warn!(channel = %ch.name, error = %e, "recovery sweep: status read failed");
+                            false
+                        }
+                    },
+                };
+                if healthy {
+                    keystate::enable_channel(&channel_id);
+                    tracing::info!(channel = %ch.name, "channel recovered; auto-disable cleared");
+                } else {
+                    keystate::record_channel_failure(&channel_id);
+                    let until = keystate::disable_channel(&channel_id);
+                    tracing::warn!(channel = %ch.name, until = %until, "channel recovery failed; auto-disable re-armed");
+                }
+            }
+         }
     });
 }

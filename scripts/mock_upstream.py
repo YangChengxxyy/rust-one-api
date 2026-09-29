@@ -40,6 +40,12 @@ class H(BaseHTTPRequestHandler):
             self.send_response(404); self.end_headers(); return
         req = self._read()
         model = req.get("model", "?")
+        if model.endswith("-fail500"):
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"error":{"message":"upstream boom"}}'); return
+        nousage = model.endswith("-nousage")
         last = ""
         for m in reversed(req.get("messages", [])):
             if m.get("role") == "user":
@@ -57,16 +63,19 @@ class H(BaseHTTPRequestHandler):
                 if usage: c["usage"] = usage
                 return f"data: {json.dumps(c)}\n\n".encode()
             self.wfile.write(chunk(content=reply))
-            self.wfile.write(chunk(finish="stop", usage={"prompt_tokens": 12, "completion_tokens": 7, "total_tokens": 19,
-                "prompt_tokens_details": {"cached_tokens": 4}}))
+            usage = None if nousage else {"prompt_tokens": 12, "completion_tokens": 7, "total_tokens": 19,
+                "prompt_tokens_details": {"cached_tokens": 4}}
+            self.wfile.write(chunk(finish="stop", usage=usage))
             self.wfile.write(b"data: [DONE]\n\n")
             return
-        body = json.dumps({
+        resp = {
             "id": "chatcmpl-mock", "object": "chat.completion", "model": model,
             "choices": [{"index": 0, "message": {"role": "assistant", "content": reply}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 12, "completion_tokens": 7, "total_tokens": 19,
-                      "prompt_tokens_details": {"cached_tokens": 4}},
-        }).encode()
+        }
+        if not nousage:
+            resp["usage"] = {"prompt_tokens": 12, "completion_tokens": 7, "total_tokens": 19,
+                      "prompt_tokens_details": {"cached_tokens": 4}}
+        body = json.dumps(resp).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers(); self.wfile.write(body)

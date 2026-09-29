@@ -15,7 +15,7 @@ use futures::StreamExt;
 use llm::sse::{SseEvent, SseParser};
 use llm::transformer::{Credentials, InboundTransformer, OutboundTransformer};
 use llm::transformers::{create_inbound, create_outbound};
-use llm::{Request, Usage};
+use llm::{Request, Usage, StreamChunk};
 use rust_decimal::Decimal;
 use std::str::FromStr;
 use serde_json::json;
@@ -25,6 +25,7 @@ use crate::error::AppError;
 use crate::pricing::{self, ModelPrice};
 use chrono::Utc;
 use crate::keystate;
+use crate::token_estimate;
 use crate::provider_quota::credentials::{
     disable_key, serving_api_keys, ChannelCredentials,
 };
@@ -60,6 +61,17 @@ impl UpstreamFailure {
 
     fn is_auth_failure(&self) -> bool {
         matches!(self.status, Some(401 | 403))
+    }
+}
+
+impl UpstreamFailure {
+    /// Channel-level failures (keystate auto-disable) are 5xx and network
+    /// errors; 4xx client errors are request problems, not channel health.
+    fn counts_as_channel_failure(&self) -> bool {
+        match self.status {
+            Some(status) => status >= 500,
+            None => true,
+        }
     }
 }
 
@@ -151,7 +163,15 @@ impl Relay {
 
         let started = Instant::now();
         let mut last_err = String::from("unknown error");
+        let mut skipped_disabled: Vec<String> = Vec::new();
         for channel in &candidates {
+            // Process-local auto-disable layer (keystate); durable status
+            // filtering already happened in list_enabled_for_model.
+            if let Some(until) = keystate::channel_disabled_until(&channel.id) {
+                tracing::debug!(channel = %channel.id, until = %until, "skipping auto-disabled channel");
+                skipped_disabled.push(format!("{} (until {until})", channel.name));
+                continue;
+            }
             let mut ch = channel.clone();
             // OAuth channels: refresh first, then prefer the OAuth access
             // token over api_key/multi-key rotation (copilot exchanges its
@@ -214,6 +234,7 @@ impl Relay {
                     .await
                 {
                     Ok(outcome) => {
+                        keystate::record_channel_success(&ch.id);
                         keystate::record_key_success(&ch.id, &key);
                         return Ok(outcome);
                     }
@@ -242,7 +263,20 @@ impl Relay {
                             continue;
                         }
                         tracing::warn!(channel = %ch.id, "upstream attempt failed: {}", f.msg);
+                        let counts = f.counts_as_channel_failure();
                         last_err = f.msg;
+                        if counts {
+                            let streak = keystate::record_channel_failure(&ch.id);
+                            if streak >= keystate::CHANNEL_DISABLE_THRESHOLD {
+                                let until = keystate::disable_channel(&ch.id);
+                                tracing::warn!(
+                                    channel = %ch.id,
+                                    name = %ch.name,
+                                    until = %until,
+                                    "channel auto-disabled after {streak} consecutive failures"
+                                );
+                            }
+                        }
                         break;
                     }
                 }
@@ -258,8 +292,16 @@ impl Relay {
             &Usage::default(),
             "failed",
             started,
+            &Uuid::new_v4().to_string(),
         )
         .await;
+        if !skipped_disabled.is_empty() && skipped_disabled.len() == candidates.len() {
+            return Err(AppError::not_found(format!(
+                "no channel available for model {requested_model}: all {} candidate(s) auto-disabled: {}",
+                candidates.len(),
+                skipped_disabled.join(", ")
+            )));
+        }
         Err(AppError::upstream(format!(
             "all upstream channels failed for model {requested_model}: {last_err}"
         )))
@@ -396,17 +438,18 @@ impl Relay {
                 &Usage::default(),
                 "failed",
                 Instant::now(),
+                &Uuid::new_v4().to_string(),
             )
             .await;
             return Ok(RelayOutcome::Json { status, body: client_body });
         }
 
         if upstream_req.stream {
-            self.stream_response(resp, inbound, outbound, channel, requested_model, api_key)
+            self.stream_response(resp, inbound, outbound, channel, requested_model, api_key, req)
                 .await
                 .map_err(UpstreamFailure::network)
         } else {
-            self.json_response(resp, inbound, outbound, channel, requested_model, api_key)
+            self.json_response(resp, inbound, outbound, channel, requested_model, api_key, req)
                 .await
                 .map_err(UpstreamFailure::network)
         }
@@ -420,6 +463,7 @@ impl Relay {
         channel: &Channel,
         requested_model: &str,
         api_key: &ApiKey,
+        req: &Request,
     ) -> Result<RelayOutcome, String> {
         let started = Instant::now();
         let body = resp
@@ -429,7 +473,31 @@ impl Relay {
         let unified = outbound
             .transform_response(&body)
             .map_err(|e| format!("bad upstream response: {e}"))?;
-        let usage = unified.usage.clone().unwrap_or_default();
+        let usage = if unified.usage.is_some() {
+            unified.usage.clone().unwrap_or_default()
+        } else {
+            // Non-stream fallback: estimate from request prompt + response text.
+            let mut completion = String::new();
+            for choice in &unified.choices {
+                if let Some(content) = &choice.message.content {
+                    token_estimate::push_capped(&mut completion, &content.text());
+                }
+                if let Some(calls) = &choice.message.tool_calls {
+                    for c in calls {
+                        token_estimate::push_capped(&mut completion, &c.function.arguments);
+                    }
+                }
+            }
+            let usage = token_estimate::final_usage(None, req, &completion);
+            tracing::warn!(
+                request_id = %Uuid::new_v4().to_string(),
+                model = %requested_model,
+                "non-stream response carried no usage; billing on estimated tokens (prompt={}, completion={})",
+                usage.prompt_tokens,
+                usage.completion_tokens
+            );
+            usage
+        };
         let client_body = inbound
             .transform_response(&unified)
             .map_err(|e| format!("encode client response: {e}"))?;
@@ -442,6 +510,7 @@ impl Relay {
             &usage,
             "success",
             started,
+            &Uuid::new_v4().to_string(),
         )
         .await;
         Ok(RelayOutcome::Json {
@@ -463,16 +532,19 @@ impl Relay {
         channel: &Channel,
         requested_model: &str,
         api_key: &ApiKey,
+        req: &Request,
     ) -> Result<RelayOutcome, String> {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
         let pool = self.pool.clone();
         let channel = channel.clone();
         let api_key_id = api_key.id.clone();
         let requested_model = requested_model.to_string();
+        let req = req.clone();
         tokio::spawn(async move {
             let started = Instant::now();
             let mut parser = SseParser::new();
-            let mut last_usage = Usage::default();
+            let mut last_usage: Option<Usage> = None;
+            let mut completion_text = String::new();
             let mut ok = true;
             let mut upstream = resp.bytes_stream();
 
@@ -486,6 +558,7 @@ impl Relay {
                                 inbound.as_ref(),
                                 outbound.as_ref(),
                                 &mut last_usage,
+                                &mut completion_text,
                             )
                             .await
                             {
@@ -512,6 +585,7 @@ impl Relay {
                         inbound.as_ref(),
                         outbound.as_ref(),
                         &mut last_usage,
+                        &mut completion_text,
                     )
                     .await
                     {
@@ -528,15 +602,31 @@ impl Relay {
                 }
             }
 
+            let request_id = Uuid::new_v4().to_string();
+            let usage = token_estimate::final_usage(
+                last_usage.as_ref(),
+                &req,
+                &completion_text,
+            );
+            if last_usage.is_none() {
+                tracing::warn!(
+                    request_id = %request_id,
+                    model = %requested_model,
+                    "upstream stream carried no usage; billing on estimated tokens (prompt={}, completion={})",
+                    usage.prompt_tokens,
+                    usage.completion_tokens
+                );
+            }
             write_billing(
                 &pool,
                 Some(api_key_id.as_str()),
                 Some(&channel),
                 &requested_model,
                 true,
-                &last_usage,
+                &usage,
                 if ok { "success" } else { "failed" },
                 started,
+                &request_id,
             )
             .await;
         });
@@ -571,15 +661,17 @@ async fn forward_event(
     ev: &SseEvent,
     inbound: &dyn InboundTransformer,
     outbound: &dyn OutboundTransformer,
-    usage: &mut Usage,
+    usage: &mut Option<Usage>,
+    completion_text: &mut String,
 ) -> Result<(), String> {
     match outbound.transform_stream_event(ev) {
         Err(e) => Err(format!("upstream stream decode: {e}")),
         Ok(chunks) => {
             for chunk in chunks {
-                if let Some(ref u) = chunk.usage {
-                    *usage = u.clone();
+                if let Some(u) = &chunk.usage {
+                    *usage = Some(u.clone());
                 }
+                accumulate_completion(&chunk, completion_text);
                 let events = inbound
                     .transform_stream_chunk(&chunk)
                     .map_err(|e| format!("client stream encode: {e}"))?;
@@ -591,6 +683,21 @@ async fn forward_event(
                 }
             }
             Ok(())
+        }
+    }
+}
+
+/// Accumulates streamed delta text (content + tool-call arguments) for the
+/// usage fallback, bounded by the 256KB cap.
+fn accumulate_completion(chunk: &StreamChunk, buf: &mut String) {
+    for ch in &chunk.choices {
+        if let Some(t) = &ch.delta.content {
+            crate::token_estimate::push_capped(buf, t);
+        }
+        if let Some(calls) = &ch.delta.tool_calls {
+            for c in calls {
+                crate::token_estimate::push_capped(buf, &c.function.arguments);
+            }
         }
     }
 }
@@ -608,6 +715,7 @@ async fn write_billing(
     usage: &Usage,
     status: &str,
     started: Instant,
+    request_id: &str,
 ) {
     let mut cost = Decimal::ZERO;
     let mut cost_items: serde_json::Value = serde_json::json!([]);
@@ -637,7 +745,7 @@ async fn write_billing(
     }
     let log = UsageLog {
         id: Uuid::new_v4().to_string(),
-        request_id: Uuid::new_v4().to_string(),
+        request_id: request_id.to_string(),
         api_key_id: api_key_id.map(str::to_string),
         channel_id: channel.map(|c| c.id.clone()),
         model: requested_model.to_string(),
@@ -670,5 +778,19 @@ mod tests {
         // identity passthrough for every other channel type
         assert_eq!(outbound_format_for_channel_type("openai"), "openai");
         assert_eq!(outbound_format_for_channel_type("gemini/gemini-pro"), "gemini/gemini-pro");
+    }
+
+    #[test]
+    fn channel_failure_counts_5xx_and_network_only() {
+        use super::UpstreamFailure;
+        let f = |status| UpstreamFailure { status, msg: String::new() };
+        assert!(UpstreamFailure::network("boom").counts_as_channel_failure());
+        assert!(f(Some(500)).counts_as_channel_failure());
+        assert!(f(Some(529)).counts_as_channel_failure());
+        // 4xx client errors are request problems, not channel health.
+        assert!(!f(Some(400)).counts_as_channel_failure());
+        assert!(!f(Some(401)).counts_as_channel_failure());
+        assert!(!f(Some(404)).counts_as_channel_failure());
+        assert!(!f(Some(429)).counts_as_channel_failure());
     }
 }

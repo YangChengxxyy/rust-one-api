@@ -43,7 +43,8 @@ pub async fn run(cfg: Config, pool: Db) -> anyhow::Result<()> {
         .route("/v1/chat/completions", post(relay_openai))
         .route("/v1/messages", post(relay_claude))
         .route("/anthropic/v1/messages", post(relay_claude))
-        .route("/gemini/{ver}/models/{model_action}", post(relay_gemini));
+        .route("/gemini/{ver}/models/{model_action}", post(relay_gemini))
+        .route("/v1/models", get(list_models));
 
     let admin_routes = Router::new()
         .route("/channels", post(admin_create_channel).get(admin_list_channels))
@@ -147,6 +148,41 @@ async fn relay_openai(
         .relay("openai/chat_completions", None, false, &api_key, &body)
         .await?;
     Ok(outcome_to_response(outcome))
+}
+
+/// Pure model aggregation: union of supported_models JSON arrays and
+/// model_mapping JSON keys across the given channels (callers pass enabled
+/// channels only), deduped and sorted.
+fn aggregate_models(channels: &[Channel]) -> Vec<String> {
+    let mut models = std::collections::BTreeSet::new();
+    for ch in channels {
+        if let Ok(list) = serde_json::from_str::<Vec<String>>(&ch.supported_models) {
+            models.extend(list);
+        }
+        if let Ok(map) =
+            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&ch.model_mapping)
+        {
+            models.extend(map.keys().cloned());
+        }
+    }
+    models.into_iter().collect()
+}
+
+async fn list_models(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    authenticate(&state, &headers, None).await?;
+    let channels: Vec<Channel> = ChannelRepo::list(&state.pool)
+        .await?
+        .into_iter()
+        .filter(|ch| ch.status == "enabled")
+        .collect();
+    let data: Vec<Value> = aggregate_models(&channels)
+        .into_iter()
+        .map(|id| json!({"id": id, "object": "model", "created": 0, "owned_by": "rust-one-api"}))
+        .collect();
+    Ok(Json(json!({"object": "list", "data": data})).into_response())
 }
 
 async fn relay_claude(
@@ -728,5 +764,62 @@ async fn admin_oauth_copilot_poll(
             oauth::delete_session(session_id);
             Ok(Json(json!({"status": "pending", "message": "access denied; restart the flow"})).into_response())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::aggregate_models;
+    use crate::storage::Channel;
+
+    fn ch(supported: &str, mapping: &str) -> Channel {
+        Channel {
+            id: "c".into(),
+            name: "c".into(),
+            channel_type: "openai".into(),
+            base_url: "http://x".into(),
+            credentials: "{}".into(),
+            disabled_api_keys: "[]".into(),
+            supported_models: supported.into(),
+            model_mapping: mapping.into(),
+            weight: 1,
+            status: "enabled".into(),
+            settings: "{}".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn aggregate_dedupes_and_sorts() {
+        let channels = vec![
+            ch(r#"["gpt-4o","claude-3"]"#, r#"{"alias-a": "up"}"#),
+            ch(r#"["gpt-4o"]"#, r#"{"alias-b": "up", "alias-a": "up2"}"#),
+        ];
+        assert_eq!(
+            aggregate_models(&channels),
+            vec!["alias-a", "alias-b", "claude-3", "gpt-4o"]
+        );
+    }
+
+    #[test]
+    fn aggregate_handles_mapping_only_and_garbage() {
+        // Mapping keys count even with an empty supported list; malformed
+        // JSON contributes nothing instead of failing.
+        let channels = vec![
+            ch("[]", r#"{"mapped": "up"}"#),
+            ch("not json", "also not json"),
+        ];
+        assert_eq!(aggregate_models(&channels), vec!["mapped"]);
+    }
+
+    #[test]
+    fn aggregate_excludes_channels_not_passed_in() {
+        // Disabled-channel exclusion is the caller's filter; anything not
+        // passed simply does not contribute.
+        let enabled = vec![ch(r#"["m1"]"#, "{}")];
+        let all = vec![ch(r#"["m1"]"#, "{}"), ch(r#"["m2"]"#, "{}")];
+        assert_eq!(aggregate_models(&enabled), vec!["m1"]);
+        assert_eq!(aggregate_models(&all), vec!["m1", "m2"]);
     }
 }

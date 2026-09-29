@@ -6,5 +6,6 @@ pub mod oauth;
 pub mod pricing;
 pub mod pricing_seed;
 pub mod provider_quota;
+pub mod token_estimate;
 pub mod server;
 pub mod storage;

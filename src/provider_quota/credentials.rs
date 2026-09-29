@@ -12,7 +12,7 @@
 //! Cookie-based checkers (ollama, commandcode fallback) read
 //! `channel.settings.provider_quota.<provider>.auth_cookie`.
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
@@ -28,10 +28,16 @@ pub struct ChannelCredentials {
     pub management_api_key: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct OAuthCredentials {
     pub access_token: String,
     pub refresh_token: Option<String>,
+    /// axonhub OAuthCredentials extras kept for round-tripping during
+    /// token refresh.
+    pub client_id: Option<String>,
+    pub id_token: Option<String>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub scopes: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -46,7 +52,16 @@ struct RawCredentials {
 #[derive(Deserialize)]
 struct RawOAuth {
     access_token: String,
+    #[serde(default)]
     refresh_token: Option<String>,
+    #[serde(default)]
+    client_id: Option<String>,
+    #[serde(default)]
+    id_token: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_opt_ts")]
+    expires_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    scopes: Vec<String>,
 }
 
 impl ChannelCredentials {
@@ -60,7 +75,14 @@ impl ChannelCredentials {
         Self {
             api_key: raw.api_key,
             api_keys: raw.api_keys,
-            oauth: raw.oauth.map(|o| OAuthCredentials { access_token: o.access_token, refresh_token: o.refresh_token }),
+            oauth: raw.oauth.map(|o| OAuthCredentials {
+                access_token: o.access_token,
+                refresh_token: o.refresh_token,
+                client_id: o.client_id,
+                id_token: o.id_token,
+                expires_at: o.expires_at,
+                scopes: o.scopes,
+            }),
             management_api_key: raw.management_api_key,
         }
     }
@@ -105,7 +127,7 @@ pub fn auth_cookie(settings_json: &str, provider: &str) -> Option<String> {
 /// A parked (disabled) API key record, port of axonhub's `DisabledAPIKey`.
 /// Persisted on the channel as a JSON array; the disable is keyed by the key
 /// plaintext. `expiresAt` marks a temporary disable that lapses on its own.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DisabledAPIKey {
     pub key: String,
@@ -181,6 +203,48 @@ pub fn serving_api_keys(creds: &ChannelCredentials, channel: &Channel) -> Vec<St
         .collect()
 }
 
+/// If `key` carries an active (non-expired) disable record, when it lapses.
+/// A permanent disable (no `expiresAt`) reports `DateTime::MAX_UTC`.
+pub fn disabled_until(channel: &Channel, key: &str) -> Option<DateTime<Utc>> {
+    let entries: Vec<DisabledAPIKey> =
+        serde_json::from_str(&channel.disabled_api_keys).unwrap_or_default();
+    entries
+        .iter()
+        .find(|e| e.key == key && !e.is_expired())
+        .map(|e| e.expires_at.unwrap_or(DateTime::<Utc>::MAX_UTC))
+}
+
+/// Parks `key` on the channel by appending a `DisabledAPIKey` record to the
+/// `disabled_api_keys` JSON array. Port of axonhub's
+/// `ChannelService.DisableAPIKey` (`internal/server/biz/channel_apikey.go`):
+/// expired entries are dropped on rewrite (its `activeDisabledKeys` filter)
+/// and any existing record for the same key is replaced (dedup), so the key
+/// appears at most once. `reason` is truncated to 200 chars.
+pub fn disable_key(
+    channel: &mut Channel,
+    key: &str,
+    error_code: i64,
+    reason: &str,
+    expires_at: Option<DateTime<Utc>>,
+) {
+    let key = key.trim();
+    if key.is_empty() {
+        return;
+    }
+    let mut entries: Vec<DisabledAPIKey> =
+        serde_json::from_str(&channel.disabled_api_keys).unwrap_or_default();
+    entries.retain(|e| !e.is_expired() && e.key != key);
+    let reason: String = reason.chars().take(200).collect();
+    entries.push(DisabledAPIKey {
+        key: key.to_string(),
+        disabled_at: Utc::now(),
+        error_code,
+        reason: Some(reason),
+        expires_at,
+    });
+    channel.disabled_api_keys = serde_json::to_string(&entries).unwrap_or_default();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +303,68 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(serving_api_keys(&creds, &ch), vec!["a", "c", "d"]);
+    }
+
+    #[test]
+    fn disable_key_dedups_and_drops_expired() {
+        let ch = |raw: &str| crate::storage::Channel {
+            disabled_api_keys: raw.to_string(),
+            ..Default::default()
+        };
+        let mut c = ch(r#"[{"key":"old","disabledAt":"2026-01-01T00:00:00Z","errorCode":500,"expiresAt":"2000-01-01T00:00:00Z"},{"key":"k1","disabledAt":"2026-01-01T00:00:00Z","errorCode":429}]"#);
+        disable_key(&mut c, "k1", 403, "first reason", Some(Utc::now() + chrono::Duration::minutes(5)));
+        let entries: Vec<DisabledAPIKey> = serde_json::from_str(&c.disabled_api_keys).unwrap();
+        // expired "old" dropped; "k1" replaced, not duplicated
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, "k1");
+        assert_eq!(entries[0].error_code, 403);
+        assert_eq!(entries[0].reason.as_deref(), Some("first reason"));
+        assert!(entries[0].expires_at.is_some());
+
+        disable_key(&mut c, "k1", 401, "second", None);
+        let entries: Vec<DisabledAPIKey> = serde_json::from_str(&c.disabled_api_keys).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].error_code, 401);
+        assert!(entries[0].expires_at.is_none());
+    }
+
+    #[test]
+    fn disable_key_truncates_reason_and_ignores_empty() {
+        let ch = |raw: &str| crate::storage::Channel {
+            disabled_api_keys: raw.to_string(),
+            ..Default::default()
+        };
+        let mut c = ch("[]");
+        let long = "x".repeat(500);
+        disable_key(&mut c, "k", 403, &long, None);
+        let entries: Vec<DisabledAPIKey> = serde_json::from_str(&c.disabled_api_keys).unwrap();
+        assert_eq!(entries[0].reason.as_deref().map(str::len), Some(200));
+
+        let mut c2 = ch("[]");
+        disable_key(&mut c2, "   ", 403, "r", None);
+        assert_eq!(c2.disabled_api_keys, "[]");
+    }
+
+    #[test]
+    fn disabled_until_respects_expiry_and_permanence() {
+        let ch = |raw: &str| crate::storage::Channel {
+            disabled_api_keys: raw.to_string(),
+            ..Default::default()
+        };
+        // active temporary disable
+        let c = ch(&format!(
+            r#"[{{"key":"k","disabledAt":"2026-01-01T00:00:00Z","errorCode":403,"expiresAt":"{}"}}]"#,
+            (Utc::now() + chrono::Duration::hours(1)).to_rfc3339()
+        ));
+        let until = disabled_until(&c, "k").unwrap();
+        assert!(until > Utc::now());
+        // expired disable -> None (key serves again)
+        let c = ch(r#"[{"key":"k","disabledAt":"2026-01-01T00:00:00Z","errorCode":403,"expiresAt":"2000-01-01T00:00:00Z"}]"#);
+        assert!(disabled_until(&c, "k").is_none());
+        // permanent disable -> far future
+        let c = ch(r#"[{"key":"k","disabledAt":"2026-01-01T00:00:00Z","errorCode":403}]"#);
+        assert_eq!(disabled_until(&c, "k"), Some(DateTime::<Utc>::MAX_UTC));
+        // unknown key
+        assert!(disabled_until(&c, "other").is_none());
     }
 }

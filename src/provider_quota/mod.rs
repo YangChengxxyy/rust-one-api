@@ -25,16 +25,19 @@ use types::QuotaError;
 /// InvalidCredentials marks the row unknown with a short retry; other errors
 /// keep status unknown and back off 5 minutes; success re-checks in 30.
 pub async fn check_channel(pool: &Db, http: &reqwest::Client, channel: &Channel) -> Result<()> {
+    // OAuth channels (claudecode/codex) may need a token refresh before the
+    // checker probes upstream; refresh failure falls back to the stale token.
+    let channel = crate::oauth::maybe_refresh_oauth(pool, http, channel).await;
     let creds = ChannelCredentials::parse(&channel.credentials);
     let now = Utc::now();
 
-    let outcome: std::result::Result<(String, types::QuotaData), QuotaError> = match checker_for_channel(channel) {
+    let outcome: std::result::Result<(String, types::QuotaData), QuotaError> = match checker_for_channel(&channel) {
         Some(checker) => checker
-            .check_quota(http, channel, &creds)
+            .check_quota(http, &channel, &creds)
             .await
             .map(|d| normalize_quota_data(d))
             .map(|d| (d.status.clone(), d)),
-        None => Ok(checkers::probe::probe(http, channel, &creds).await),
+        None => Ok(checkers::probe::probe(http, &channel, &creds).await),
     };
 
     // Fill period_cost from our usage logs, then derive period_quota

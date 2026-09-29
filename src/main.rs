@@ -25,6 +25,10 @@ async fn main() {
         std::process::exit(1);
     }
 
+    if let Err(e) = rust_one_api::pricing_seed::seed_model_prices(&pool).await {
+        tracing::warn!("model price seeding failed: {e}");
+    }
+
     let http = reqwest::Client::new();
     provider_quota::spawn_scheduler(pool.clone(), http);
 

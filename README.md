@@ -46,6 +46,12 @@ curl -X POST localhost:3000/v1/messages -H 'x-api-key: sk-demo' -H 'Content-Type
 curl -X POST 'localhost:3000/gemini/v1beta/models/gpt-4o-mini:generateContent?key=sk-demo' -H 'Content-Type: application/json' -d '{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}'
 ```
 
+## 模型价格目录（参考快照）
+
+启动时（migrate 之后）会从内嵌的 `data/model_prices.seed.yaml` 为 21 个常见模型写入全局（无渠道）价格：OpenAI（gpt-4o/4.1/5 系、o3、o4-mini）、Anthropic（claude-3.5/3.7/4/4.5 系，含 `cache_write_tokens` 5 分钟写入价）、Gemini（2.0/2.5 flash、2.5 pro 阶梯价 ≤200k / >200k tokens 渐进计价）。单位均为美元 / 1M tokens。
+
+该快照为 2026-09 编译时的公开价格汇总，构建时未联网核对厂商页面，生产计费前请以厂商官网为准。价格只是参考初值，可用 `/admin/prices` 随时新增或覆盖（渠道级价格优先于全局价）；仅当 `model_prices` 表为空时才会播种，不会覆盖已有数据。播种失败只记录警告，不阻塞启动。
+
 ## API 一览
 
 Relay（`Authorization: Bearer` / `x-api-key` / `?key=`）：

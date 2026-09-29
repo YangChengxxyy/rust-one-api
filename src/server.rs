@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::error::AppError;
+use crate::oauth;
 use crate::orchestrator::{Relay, RelayOutcome};
 use crate::provider_quota::check_channel;
 use crate::storage::{
@@ -59,6 +60,13 @@ pub async fn run(cfg: Config, pool: Db) -> anyhow::Result<()> {
         .route("/quota/check", post(admin_quota_check))
         .route("/channels/{id}/quota/resets", get(admin_channel_quota_resets))
         .route("/channels/{id}/quota/reset", post(admin_channel_quota_reset))
+        .route("/oauth/claudecode/start", post(admin_oauth_claude_start))
+        .route("/oauth/claudecode/exchange", post(admin_oauth_claude_exchange))
+        .route("/oauth/codex/start", post(admin_oauth_codex_start))
+        .route("/oauth/codex/exchange", post(admin_oauth_codex_exchange))
+        .route("/oauth/codex/decode", post(admin_oauth_codex_decode))
+        .route("/oauth/copilot/start", post(admin_oauth_copilot_start))
+        .route("/oauth/copilot/poll", post(admin_oauth_copilot_poll))
         .layer(middleware::from_fn_with_state(state.clone(), admin_guard));
 
     let app = Router::new()
@@ -532,4 +540,193 @@ async fn admin_channel_quota_reset(
     let creds = crate::provider_quota::credentials::ChannelCredentials::parse(&channel.credentials);
     resetter.reset(&state.http, &channel, &creds).await.map_err(|e| AppError::upstream(e.to_string()))?;
     Ok(Json(json!({"ok": true})).into_response())
+}
+
+// ---------- admin oauth ----------
+
+fn bad(msg: impl Into<String>) -> AppError {
+    AppError::bad_request(msg.into())
+}
+
+/// Attaches the OAuth result to `channel_id` (merge `credentials.oauth` /
+/// set `credentials.api_key`) and persists via ChannelRepo::update.
+async fn attach_oauth(
+    state: &AppState,
+    channel_id: &str,
+    f: impl FnOnce(&mut Channel),
+) -> Result<(), AppError> {
+    let mut ch = ChannelRepo::get(&state.pool, channel_id)
+        .await?
+        .ok_or_else(|| bad(format!("channel {channel_id} not found")))?;
+    f(&mut ch);
+    ChannelRepo::update(&state.pool, &ch).await?;
+    Ok(())
+}
+
+async fn admin_oauth_claude_start(
+    State(_state): State<Arc<AppState>>,
+) -> Result<Response, AppError> {
+    let session_id = oauth::new_state();
+    let (verifier, challenge) = oauth::pkce_pair();
+    oauth::put_session(
+        &session_id,
+        oauth::OAuthSession {
+            code_verifier: Some(verifier),
+            device: None,
+            created_at: chrono::Utc::now(),
+        },
+    );
+    Ok(Json(json!({
+        "session_id": session_id,
+        "auth_url": oauth::claude_auth_url(&session_id, &challenge),
+    }))
+    .into_response())
+}
+
+async fn admin_oauth_claude_exchange(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Result<Response, AppError> {
+    let session_id = require(&body, "session_id")?;
+    let callback_url = require(&body, "callback_url")?;
+    let session = oauth::get_session(session_id)
+        .ok_or_else(|| bad("unknown or expired session"))?;
+    let verifier = session
+        .code_verifier
+        .ok_or_else(|| bad("session has no code verifier"))?;
+    let code = oauth::parse_callback_url(callback_url, session_id).map_err(bad)?;
+    let set = oauth::exchange_code(&state.http, "claudecode", &code, &verifier, session_id)
+        .await
+        .map_err(|e| bad(format!("token exchange failed: {e}")))?;
+    oauth::delete_session(session_id);
+    let credentials = oauth::token_set_to_oauth_json(&set, Some(oauth::CLAUDE_CLIENT_ID));
+    if let Some(cid) = body.get("channel_id").and_then(|v| v.as_str()) {
+        let cred = credentials.clone();
+        attach_oauth(&state, cid, move |ch| oauth::merge_oauth_into(ch, &cred)).await?;
+    }
+    Ok(Json(json!({"credentials": credentials})).into_response())
+}
+
+async fn admin_oauth_codex_start(
+    State(_state): State<Arc<AppState>>,
+) -> Result<Response, AppError> {
+    let session_id = oauth::new_state();
+    let (verifier, challenge) = oauth::pkce_pair();
+    oauth::put_session(
+        &session_id,
+        oauth::OAuthSession {
+            code_verifier: Some(verifier),
+            device: None,
+            created_at: chrono::Utc::now(),
+        },
+    );
+    Ok(Json(json!({
+        "session_id": session_id,
+        "auth_url": oauth::codex_auth_url(&session_id, &challenge),
+    }))
+    .into_response())
+}
+
+async fn admin_oauth_codex_exchange(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Result<Response, AppError> {
+    let session_id = require(&body, "session_id")?;
+    let callback_url = require(&body, "callback_url")?;
+    let session = oauth::get_session(session_id)
+        .ok_or_else(|| bad("unknown or expired session"))?;
+    let verifier = session
+        .code_verifier
+        .ok_or_else(|| bad("session has no code verifier"))?;
+    // codex: code + state both in the query string
+    let code = oauth::parse_callback_url(callback_url, session_id).map_err(bad)?;
+    let set = oauth::exchange_code(&state.http, "codex", &code, &verifier, session_id)
+        .await
+        .map_err(|e| bad(format!("token exchange failed: {e}")))?;
+    oauth::delete_session(session_id);
+    let credentials = oauth::token_set_to_oauth_json(&set, Some(oauth::CODEX_CLIENT_ID));
+    if let Some(cid) = body.get("channel_id").and_then(|v| v.as_str()) {
+        let cred = credentials.clone();
+        attach_oauth(&state, cid, move |ch| oauth::merge_oauth_into(ch, &cred)).await?;
+    }
+    Ok(Json(json!({"credentials": credentials})).into_response())
+}
+
+/// Decodes a codex CLI `auth.json` pasted by the operator.
+async fn admin_oauth_codex_decode(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Result<Response, AppError> {
+    let auth_json = require(&body, "auth_json")?;
+    let set = oauth::decode_codex_auth_json(auth_json, chrono::Utc::now()).map_err(bad)?;
+    let credentials = oauth::token_set_to_oauth_json(&set, Some(oauth::CODEX_CLIENT_ID));
+    if let Some(cid) = body.get("channel_id").and_then(|v| v.as_str()) {
+        let cred = credentials.clone();
+        attach_oauth(&state, cid, move |ch| oauth::merge_oauth_into(ch, &cred)).await?;
+    }
+    Ok(Json(json!({"credentials": credentials})).into_response())
+}
+
+async fn admin_oauth_copilot_start(
+    State(state): State<Arc<AppState>>,
+) -> Result<Response, AppError> {
+    let session_id = oauth::new_state();
+    let (_device_code, device, resp) = oauth::copilot_device_start(&state.http)
+        .await
+        .map_err(|e| bad(format!("device flow start failed: {e}")))?;
+    oauth::put_session(
+        &session_id,
+        oauth::OAuthSession {
+            code_verifier: None,
+            device: Some(device),
+            created_at: chrono::Utc::now(),
+        },
+    );
+    Ok(Json(json!({
+        "session_id": session_id,
+        "user_code": resp.get("user_code").and_then(|v| v.as_str()),
+        "verification_uri": resp.get("verification_uri").and_then(|v| v.as_str()),
+        "expires_in": resp.get("expires_in").and_then(|v| v.as_i64()),
+        "interval": resp.get("interval").and_then(|v| v.as_i64()),
+    }))
+    .into_response())
+}
+
+async fn admin_oauth_copilot_poll(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Result<Response, AppError> {
+    let session_id = require(&body, "session_id")?;
+    let session = oauth::get_session(session_id)
+        .ok_or_else(|| bad("unknown or expired session"))?;
+    let device = session
+        .device
+        .ok_or_else(|| bad("session is not a device flow"))?;
+    let result = oauth::copilot_device_poll(&state.http, &device)
+        .await
+        .map_err(|e| bad(format!("device poll failed: {e}")))?;
+    match result {
+        Ok(token) => {
+            oauth::delete_session(session_id);
+            if let Some(cid) = body.get("channel_id").and_then(|v| v.as_str()) {
+                let t = token.clone();
+                attach_oauth(&state, cid, move |ch| oauth::set_api_key_into(ch, &t)).await?;
+            }
+            Ok(Json(json!({"status": "complete", "access_token": token})).into_response())
+        }
+        Err(oauth::DevicePollStatus::Pending) => {
+            Ok(Json(json!({"status": "pending"})).into_response())
+        }
+        Err(oauth::DevicePollStatus::SlowDown) => {
+            Ok(Json(json!({"status": "slow_down"})).into_response())
+        }
+        Err(oauth::DevicePollStatus::Expired) => {
+            oauth::delete_session(session_id);
+            Ok(Json(json!({"status": "pending", "message": "device code expired; restart the flow"})).into_response())
+        }
+        Err(oauth::DevicePollStatus::Denied) => {
+            oauth::delete_session(session_id);
+            Ok(Json(json!({"status": "pending", "message": "access denied; restart the flow"})).into_response())
+        }
+    }
 }

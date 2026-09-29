@@ -37,6 +37,7 @@ uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
 bytes = "1"
 base64 = "0.22"
+parking_lot = "0.12"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

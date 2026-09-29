@@ -24,7 +24,10 @@ use uuid::Uuid;
 use crate::error::AppError;
 use crate::pricing::{self, ModelPrice};
 use chrono::Utc;
-use crate::provider_quota::credentials::ChannelCredentials;
+use crate::keystate;
+use crate::provider_quota::credentials::{
+    disable_key, serving_api_keys, ChannelCredentials,
+};
 use crate::provider_quota::routing;
 use crate::provider_quota::types::{QuotaData, QuotaLimitType};
 use crate::storage::{
@@ -40,6 +43,24 @@ pub enum RelayOutcome {
     /// task that owns the upstream stream, so billing (usage_log insert) is
     /// written even if the client disconnects mid-stream.
     Stream(futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>>),
+}
+
+/// Retryable upstream failure carrying the HTTP status when one was received,
+/// so the relay loop can distinguish auth failures (401/403 -> disable the
+/// key, retry same channel) from 5xx/network errors (move to next candidate).
+struct UpstreamFailure {
+    status: Option<u16>,
+    msg: String,
+}
+
+impl UpstreamFailure {
+    fn network(msg: impl Into<String>) -> Self {
+        Self { status: None, msg: msg.into() }
+    }
+
+    fn is_auth_failure(&self) -> bool {
+        matches!(self.status, Some(401 | 403))
+    }
 }
 
 pub struct Relay {
@@ -131,14 +152,99 @@ impl Relay {
         let started = Instant::now();
         let mut last_err = String::from("unknown error");
         for channel in &candidates {
-            match self
-                .try_channel(channel, &req, &requested_model, api_key, inbound_format)
-                .await
-            {
-                Ok(outcome) => return Ok(outcome),
-                Err(msg) => {
-                    tracing::warn!(channel = %channel.id, "upstream attempt failed: {msg}");
-                    last_err = msg;
+            let mut ch = channel.clone();
+            // OAuth channels: refresh first, then prefer the OAuth access
+            // token over api_key/multi-key rotation (copilot exchanges its
+            // GitHub token for a short-lived relay bearer).
+            ch = crate::oauth::maybe_refresh_oauth(&self.pool, &self.http, &ch).await;
+            let creds_typed = ChannelCredentials::parse(&ch.credentials);
+            let mut serving = match ch.channel_type.as_str() {
+                "claudecode" | "codex" => creds_typed
+                    .oauth_access_token()
+                    .map(|t| vec![t])
+                    .unwrap_or_default(),
+                "github_copilot" => {
+                    let github_token = creds_typed
+                        .api_key
+                        .clone()
+                        .or_else(|| creds_typed.all_api_keys().first().map(|s| s.to_string()));
+                    let exchanged = match github_token {
+                        Some(t) => crate::oauth::copilot_token(&self.http, &t).await,
+                        None => Err(anyhow::anyhow!("copilot channel has no github token")),
+                    };
+                    match exchanged {
+                        Ok(copilot) => vec![copilot],
+                        Err(e) => {
+                            tracing::warn!(channel = %ch.id, "copilot token exchange failed: {e}");
+                            last_err = format!("copilot token exchange failed: {e}");
+                            continue;
+                        }
+                    }
+                }
+                _ => Vec::new(),
+            };
+            if serving.is_empty() {
+                // No OAuth token: rotate the api_keys array as before.
+                serving = serving_api_keys(&creds_typed, &ch);
+            }
+            if serving.is_empty() {
+                // Fallback for channels without an api_keys array: the raw
+                // single api_key (possibly an OAuth blob) verbatim.
+                let creds: serde_json::Value =
+                    serde_json::from_str(&ch.credentials).unwrap_or(json!({}));
+                if let Some(k) = creds.get("api_key").and_then(|v| v.as_str()) {
+                    if !k.trim().is_empty() {
+                        serving.push(k.trim().to_string());
+                    }
+                }
+            }
+            // Key-level retry (axonhub ChannelRetryable semantics): a 401/403
+            // parks the offending key (persisted via ChannelRepo::update) and
+            // retries the SAME channel with the next serving key. Key retries
+            // do NOT consume the 3-candidate budget above; each distinct key
+            // is tried at most once per request (`tried`). 5xx/network errors
+            // and exhausted keys move to the next candidate channel.
+            let mut tried = std::collections::HashSet::new();
+            while let Some(key) = keystate::next_key(&serving, &ch.id) {
+                if !tried.insert(key.clone()) {
+                    break;
+                }
+                match self
+                    .try_channel(&ch, &key, &req, &requested_model, api_key, inbound_format)
+                    .await
+                {
+                    Ok(outcome) => {
+                        keystate::record_key_success(&ch.id, &key);
+                        return Ok(outcome);
+                    }
+                    Err(f) => {
+                        if f.is_auth_failure() {
+                            let streak = keystate::record_key_failure(&ch.id, &key);
+                            let expires_at = keystate::disable_expires_at(streak);
+                            let status = f.status.unwrap_or(0);
+                            disable_key(&mut ch, &key, status as i64, &f.msg, expires_at);
+                            if let Err(e) = ChannelRepo::update(&self.pool, &ch).await {
+                                tracing::warn!(
+                                    channel = %ch.id,
+                                    "failed to persist disabled_api_keys: {e}"
+                                );
+                            }
+                            tracing::warn!(
+                                channel = %ch.id,
+                                key = %key,
+                                "api key disabled after upstream {status}, retrying channel"
+                            );
+                            serving.retain(|k| k != &key);
+                            last_err = f.msg;
+                            if serving.is_empty() {
+                                break;
+                            }
+                            continue;
+                        }
+                        tracing::warn!(channel = %ch.id, "upstream attempt failed: {}", f.msg);
+                        last_err = f.msg;
+                        break;
+                    }
                 }
             }
         }
@@ -204,21 +310,25 @@ impl Relay {
         Ok(())
     }
 
-    /// One attempt against one channel. `Err` = retryable failure message;
-    /// `Ok(RelayOutcome::Json{4xx})` = upstream client error surfaced in the
-    /// client's own wire format (already logged, no retry).
+    /// One attempt against one channel with a specific upstream key.
+    /// `Err(UpstreamFailure)` = retryable failure; `Ok(RelayOutcome::Json{4xx})`
+    /// = upstream client error surfaced in the client's own wire format
+    /// (already logged, no retry). 401/403 come back as `Err` with the status
+    /// set so the relay loop can disable the key and rotate.
     async fn try_channel(
         &self,
         channel: &Channel,
+        upstream_key: &str,
         req: &Request,
         requested_model: &str,
         api_key: &ApiKey,
         inbound_format: &str,
-    ) -> Result<RelayOutcome, String> {
+    ) -> Result<RelayOutcome, UpstreamFailure> {
         // Fresh inbound instance per attempt: instances are per-request and
         // may be stateful (e.g. Anthropic content_block lifecycle).
-        let inbound = create_inbound_used(inbound_format)
-            .ok_or_else(|| format!("unknown inbound format {inbound_format}"))?;
+        let inbound = create_inbound_used(inbound_format).ok_or_else(|| {
+            UpstreamFailure::network(format!("unknown inbound format {inbound_format}"))
+        })?;
         // Apply model_mapping: requested -> upstream model name.
         let mapping: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(&channel.model_mapping).unwrap_or_default();
@@ -227,26 +337,17 @@ impl Relay {
             upstream_req.model = mapped.to_string();
         }
 
-        let creds: serde_json::Value =
-            serde_json::from_str(&channel.credentials).unwrap_or(json!({}));
-        // Prefer the first still-serving key when multiple api_keys rotate.
-        let creds_typed = ChannelCredentials::parse(&channel.credentials);
-        let upstream_key = crate::provider_quota::credentials::serving_api_keys(&creds_typed, channel)
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| {
-                creds
-                    .get("api_key")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string()
-            });
-
-        let outbound = create_outbound(&channel.channel_type)
-            .ok_or_else(|| format!("unknown channel type {}", channel.channel_type))?;
+        let outbound = create_outbound(outbound_format_for_channel_type(&channel.channel_type))
+            .ok_or_else(|| {
+                UpstreamFailure::network(format!(
+                    "unknown channel type {}",
+                    channel.channel_type
+                ))
+            })?;
         let out_req = outbound
-            .build_request(&upstream_req, &Credentials { api_key: upstream_key })
-            .map_err(|e| format!("build upstream request: {e}"))?;
+            .build_request(&upstream_req, &Credentials { api_key: upstream_key.to_string() })
+            .map_err(|e| UpstreamFailure::network(format!("build upstream request: {e}")))?;
+
 
         let url = format!("{}{}", channel.base_url.trim_end_matches('/'), out_req.path);
         let mut http_req = self
@@ -260,12 +361,25 @@ impl Relay {
             .body(out_req.body)
             .send()
             .await
-            .map_err(|e| format!("network: {e}"))?;
+            .map_err(|e| UpstreamFailure::network(format!("network: {e}")))?;
 
         let status = resp.status().as_u16();
         if status >= 500 {
             let body = resp.bytes().await.unwrap_or_default();
-            return Err(format!("upstream {status}: {}", String::from_utf8_lossy(&body)));
+            return Err(UpstreamFailure::network(format!(
+                "upstream {status}: {}",
+                String::from_utf8_lossy(&body)
+            )));
+        }
+        if status == 401 || status == 403 {
+            // Auth failure for THIS key: the relay loop disables it and
+            // retries the channel with the next key (axonhub disables on
+            // 401/403; 429 and other 4xx never disable a key).
+            let body = resp.bytes().await.unwrap_or_default();
+            return Err(UpstreamFailure {
+                status: Some(status),
+                msg: format!("upstream {status}: {}", String::from_utf8_lossy(&body)),
+            });
         }
         if status >= 400 {
             // No retry on 4xx; log a failed usage row and surface the error
@@ -290,9 +404,11 @@ impl Relay {
         if upstream_req.stream {
             self.stream_response(resp, inbound, outbound, channel, requested_model, api_key)
                 .await
+                .map_err(UpstreamFailure::network)
         } else {
             self.json_response(resp, inbound, outbound, channel, requested_model, api_key)
                 .await
+                .map_err(UpstreamFailure::network)
         }
     }
 
@@ -411,6 +527,7 @@ impl Relay {
                     }
                 }
             }
+
             write_billing(
                 &pool,
                 Some(api_key_id.as_str()),
@@ -434,6 +551,16 @@ impl Relay {
 
 fn create_inbound_used(format: &str) -> Option<Box<dyn InboundTransformer>> {
     create_inbound(format)
+}
+
+/// OAuth-backed channel types relay through a different outbound wire format
+/// than their channel_type name suggests (axonhub transformer mapping).
+pub fn outbound_format_for_channel_type(ct: &str) -> &str {
+    match ct {
+        "claudecode" => "claude/messages",
+        "codex" | "github_copilot" => "openai/chat_completions",
+        other => other,
+    }
 }
 
 /// Feed one upstream SSE event through both transformers; returns false-y Err
@@ -528,5 +655,20 @@ async fn write_billing(
     };
     if let Err(e) = UsageLogRepo::insert(pool, &log).await {
         tracing::error!("usage log insert failed: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::outbound_format_for_channel_type;
+
+    #[test]
+    fn outbound_format_mapping() {
+        assert_eq!(outbound_format_for_channel_type("claudecode"), "claude/messages");
+        assert_eq!(outbound_format_for_channel_type("codex"), "openai/chat_completions");
+        assert_eq!(outbound_format_for_channel_type("github_copilot"), "openai/chat_completions");
+        // identity passthrough for every other channel type
+        assert_eq!(outbound_format_for_channel_type("openai"), "openai");
+        assert_eq!(outbound_format_for_channel_type("gemini/gemini-pro"), "gemini/gemini-pro");
     }
 }

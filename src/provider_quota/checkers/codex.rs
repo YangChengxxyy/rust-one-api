@@ -660,7 +660,7 @@ mod tests {
 
         let access_token = test_jwt("acct_reset");
         let creds = ChannelCredentials {
-            oauth: Some(OAuthCredentials { access_token: access_token.clone(), refresh_token: None }),
+            oauth: Some(OAuthCredentials { access_token: access_token.clone(), refresh_token: None, ..Default::default() }),
             ..Default::default()
         };
         let (tok, account_id) = extract_reset_credentials(&creds).unwrap();

@@ -1,0 +1,158 @@
+# 参考快照（2026-09 公开价格，美元/1M tokens），以厂商官网为准；可用 /admin/prices 覆盖
+# Source: compiled public pricing snapshot 2026-09, NOT checked against live vendor pages
+# (no network at build time). Verify against vendor pricing pages before production billing.
+# Item order per model: prompt / completion / cached read [/ cache write (Anthropic 5m write)].
+
+# ---------- OpenAI ----------
+- model: gpt-4o
+  price:
+    items:
+      - {code: prompt_tokens, pricing: {mode: usage_per_unit, unit_price: "2.50", unit_size: 1000000}}
+      - {code: completion_tokens, pricing: {mode: usage_per_unit, unit_price: "10.00", unit_size: 1000000}}
+      - {code: cached_tokens, pricing: {mode: usage_per_unit, unit_price: "1.25", unit_size: 1000000}}
+- model: gpt-4o-mini
+  price:
+    items:
+      - {code: prompt_tokens, pricing: {mode: usage_per_unit, unit_price: "0.15", unit_size: 1000000}}
+      - {code: completion_tokens, pricing: {mode: usage_per_unit, unit_price: "0.60", unit_size: 1000000}}
+      - {code: cached_tokens, pricing: {mode: usage_per_unit, unit_price: "0.075", unit_size: 1000000}}
+- model: gpt-4.1
+  price:
+    items:
+      - {code: prompt_tokens, pricing: {mode: usage_per_unit, unit_price: "2.00", unit_size: 1000000}}
+      - {code: completion_tokens, pricing: {mode: usage_per_unit, unit_price: "8.00", unit_size: 1000000}}
+      - {code: cached_tokens, pricing: {mode: usage_per_unit, unit_price: "0.50", unit_size: 1000000}}
+- model: gpt-4.1-mini
+  price:
+    items:
+      - {code: prompt_tokens, pricing: {mode: usage_per_unit, unit_price: "0.40", unit_size: 1000000}}
+      - {code: completion_tokens, pricing: {mode: usage_per_unit, unit_price: "1.60", unit_size: 1000000}}
+      - {code: cached_tokens, pricing: {mode: usage_per_unit, unit_price: "0.10", unit_size: 1000000}}
+- model: gpt-4.1-nano
+  price:
+    items:
+      - {code: prompt_tokens, pricing: {mode: usage_per_unit, unit_price: "0.10", unit_size: 1000000}}
+      - {code: completion_tokens, pricing: {mode: usage_per_unit, unit_price: "0.40", unit_size: 1000000}}
+      - {code: cached_tokens, pricing: {mode: usage_per_unit, unit_price: "0.025", unit_size: 1000000}}
+- model: gpt-5
+  price:
+    items:
+      - {code: prompt_tokens, pricing: {mode: usage_per_unit, unit_price: "1.25", unit_size: 1000000}}
+      - {code: completion_tokens, pricing: {mode: usage_per_unit, unit_price: "10.00", unit_size: 1000000}}
+      - {code: cached_tokens, pricing: {mode: usage_per_unit, unit_price: "0.125", unit_size: 1000000}}
+- model: gpt-5-mini
+  price:
+    items:
+      - {code: prompt_tokens, pricing: {mode: usage_per_unit, unit_price: "0.25", unit_size: 1000000}}
+      - {code: completion_tokens, pricing: {mode: usage_per_unit, unit_price: "2.00", unit_size: 1000000}}
+      - {code: cached_tokens, pricing: {mode: usage_per_unit, unit_price: "0.025", unit_size: 1000000}}
+- model: gpt-5-nano
+  price:
+    items:
+      - {code: prompt_tokens, pricing: {mode: usage_per_unit, unit_price: "0.05", unit_size: 1000000}}
+      - {code: completion_tokens, pricing: {mode: usage_per_unit, unit_price: "0.40", unit_size: 1000000}}
+      - {code: cached_tokens, pricing: {mode: usage_per_unit, unit_price: "0.005", unit_size: 1000000}}
+- model: o3
+  price:
+    items:
+      - {code: prompt_tokens, pricing: {mode: usage_per_unit, unit_price: "2.00", unit_size: 1000000}}
+      - {code: completion_tokens, pricing: {mode: usage_per_unit, unit_price: "8.00", unit_size: 1000000}}
+      - {code: cached_tokens, pricing: {mode: usage_per_unit, unit_price: "0.50", unit_size: 1000000}}
+- model: o4-mini
+  price:
+    items:
+      - {code: prompt_tokens, pricing: {mode: usage_per_unit, unit_price: "1.10", unit_size: 1000000}}
+      - {code: completion_tokens, pricing: {mode: usage_per_unit, unit_price: "4.40", unit_size: 1000000}}
+      - {code: cached_tokens, pricing: {mode: usage_per_unit, unit_price: "0.275", unit_size: 1000000}}
+
+# ---------- Anthropic (cache_write = 5m write price) ----------
+- model: claude-3-5-sonnet
+  price:
+    items:
+      - {code: prompt_tokens, pricing: {mode: usage_per_unit, unit_price: "3.00", unit_size: 1000000}}
+      - {code: completion_tokens, pricing: {mode: usage_per_unit, unit_price: "15.00", unit_size: 1000000}}
+      - {code: cached_tokens, pricing: {mode: usage_per_unit, unit_price: "0.30", unit_size: 1000000}}
+      - {code: cache_write_tokens, pricing: {mode: usage_per_unit, unit_price: "3.75", unit_size: 1000000}}
+- model: claude-3-7-sonnet
+  price:
+    items:
+      - {code: prompt_tokens, pricing: {mode: usage_per_unit, unit_price: "3.00", unit_size: 1000000}}
+      - {code: completion_tokens, pricing: {mode: usage_per_unit, unit_price: "15.00", unit_size: 1000000}}
+      - {code: cached_tokens, pricing: {mode: usage_per_unit, unit_price: "0.30", unit_size: 1000000}}
+      - {code: cache_write_tokens, pricing: {mode: usage_per_unit, unit_price: "3.75", unit_size: 1000000}}
+- model: claude-sonnet-4
+  price:
+    items:
+      - {code: prompt_tokens, pricing: {mode: usage_per_unit, unit_price: "3.00", unit_size: 1000000}}
+      - {code: completion_tokens, pricing: {mode: usage_per_unit, unit_price: "15.00", unit_size: 1000000}}
+      - {code: cached_tokens, pricing: {mode: usage_per_unit, unit_price: "0.30", unit_size: 1000000}}
+      - {code: cache_write_tokens, pricing: {mode: usage_per_unit, unit_price: "3.75", unit_size: 1000000}}
+- model: claude-sonnet-4-5
+  price:
+    items:
+      - {code: prompt_tokens, pricing: {mode: usage_per_unit, unit_price: "3.00", unit_size: 1000000}}
+      - {code: completion_tokens, pricing: {mode: usage_per_unit, unit_price: "15.00", unit_size: 1000000}}
+      - {code: cached_tokens, pricing: {mode: usage_per_unit, unit_price: "0.30", unit_size: 1000000}}
+      - {code: cache_write_tokens, pricing: {mode: usage_per_unit, unit_price: "3.75", unit_size: 1000000}}
+- model: claude-opus-4
+  price:
+    items:
+      - {code: prompt_tokens, pricing: {mode: usage_per_unit, unit_price: "15.00", unit_size: 1000000}}
+      - {code: completion_tokens, pricing: {mode: usage_per_unit, unit_price: "75.00", unit_size: 1000000}}
+      - {code: cached_tokens, pricing: {mode: usage_per_unit, unit_price: "1.50", unit_size: 1000000}}
+      - {code: cache_write_tokens, pricing: {mode: usage_per_unit, unit_price: "18.75", unit_size: 1000000}}
+- model: claude-opus-4-1
+  price:
+    items:
+      - {code: prompt_tokens, pricing: {mode: usage_per_unit, unit_price: "15.00", unit_size: 1000000}}
+      - {code: completion_tokens, pricing: {mode: usage_per_unit, unit_price: "75.00", unit_size: 1000000}}
+      - {code: cached_tokens, pricing: {mode: usage_per_unit, unit_price: "1.50", unit_size: 1000000}}
+      - {code: cache_write_tokens, pricing: {mode: usage_per_unit, unit_price: "18.75", unit_size: 1000000}}
+- model: claude-3-5-haiku
+  price:
+    items:
+      - {code: prompt_tokens, pricing: {mode: usage_per_unit, unit_price: "0.80", unit_size: 1000000}}
+      - {code: completion_tokens, pricing: {mode: usage_per_unit, unit_price: "4.00", unit_size: 1000000}}
+      - {code: cached_tokens, pricing: {mode: usage_per_unit, unit_price: "0.08", unit_size: 1000000}}
+      - {code: cache_write_tokens, pricing: {mode: usage_per_unit, unit_price: "1.00", unit_size: 1000000}}
+- model: claude-haiku-4-5
+  price:
+    items:
+      - {code: prompt_tokens, pricing: {mode: usage_per_unit, unit_price: "1.00", unit_size: 1000000}}
+      - {code: completion_tokens, pricing: {mode: usage_per_unit, unit_price: "5.00", unit_size: 1000000}}
+      - {code: cached_tokens, pricing: {mode: usage_per_unit, unit_price: "0.10", unit_size: 1000000}}
+      - {code: cache_write_tokens, pricing: {mode: usage_per_unit, unit_price: "1.25", unit_size: 1000000}}
+
+# ---------- Google Gemini ----------
+- model: gemini-2.0-flash
+  price:
+    items:
+      - {code: prompt_tokens, pricing: {mode: usage_per_unit, unit_price: "0.10", unit_size: 1000000}}
+      - {code: completion_tokens, pricing: {mode: usage_per_unit, unit_price: "0.40", unit_size: 1000000}}
+      - {code: cached_tokens, pricing: {mode: usage_per_unit, unit_price: "0.025", unit_size: 1000000}}
+- model: gemini-2.5-flash
+  price:
+    items:
+      - {code: prompt_tokens, pricing: {mode: usage_per_unit, unit_price: "0.30", unit_size: 1000000}}
+      - {code: completion_tokens, pricing: {mode: usage_per_unit, unit_price: "2.50", unit_size: 1000000}}
+      - {code: cached_tokens, pricing: {mode: usage_per_unit, unit_price: "0.075", unit_size: 1000000}}
+# gemini-2.5-pro tiered above/below 200k tokens (tier quantities are tokens, price per 1M);
+# cached read price uncertain — verify before billing.
+- model: gemini-2.5-pro
+  price:
+    items:
+      - code: prompt_tokens
+        pricing:
+          mode: usage_tiered
+          unit_size: 1000000
+          tiers:
+            - {up_to: 200000, unit_price: "1.25"}
+            - {up_to: null, unit_price: "2.50"}
+      - code: completion_tokens
+        pricing:
+          mode: usage_tiered
+          unit_size: 1000000
+          tiers:
+            - {up_to: 200000, unit_price: "10.00"}
+            - {up_to: null, unit_price: "15.00"}
+      - {code: cached_tokens, pricing: {mode: usage_per_unit, unit_price: "0.31", unit_size: 1000000}}

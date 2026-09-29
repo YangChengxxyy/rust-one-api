@@ -193,7 +193,7 @@ impl ChannelRepo {
     pub async fn insert(pool: &AnyPool, ch: &Channel) -> Result<()> {
         sqlx::query(
             "INSERT INTO channels (id, name, channel_type, base_url, credentials, disabled_api_keys, supported_models, model_mapping, weight, status, settings, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(&ch.id)
         .bind(&ch.name)
@@ -215,7 +215,7 @@ impl ChannelRepo {
 
     pub async fn update(pool: &AnyPool, ch: &Channel) -> Result<()> {
         sqlx::query(
-            "UPDATE channels SET name = ?, channel_type = ?, base_url = ?, credentials = ?, disabled_api_keys = ?, supported_models = ?, model_mapping = ?, weight = ?, status = ?, settings = ?, updated_at = ? WHERE id = ?",
+            "UPDATE channels SET name = $1, channel_type = $2, base_url = $3, credentials = $4, disabled_api_keys = $5, supported_models = $6, model_mapping = $7, weight = $8, status = $9, settings = $10, updated_at = $11 WHERE id = $12",
         )
         .bind(&ch.name)
         .bind(&ch.channel_type)
@@ -235,7 +235,7 @@ impl ChannelRepo {
     }
 
     pub async fn delete(pool: &AnyPool, id: &str) -> Result<()> {
-        sqlx::query("DELETE FROM channels WHERE id = ?")
+        sqlx::query("DELETE FROM channels WHERE id = $1")
             .bind(id)
             .execute(pool)
             .await?;
@@ -243,7 +243,7 @@ impl ChannelRepo {
     }
 
     pub async fn get(pool: &AnyPool, id: &str) -> Result<Option<Channel>> {
-        sqlx::query_as::<_, Channel>("SELECT * FROM channels WHERE id = ?")
+        sqlx::query_as::<_, Channel>("SELECT * FROM channels WHERE id = $1")
             .bind(id)
             .fetch_optional(pool)
             .await
@@ -290,7 +290,7 @@ pub struct ApiKeyRepo;
 impl ApiKeyRepo {
     pub async fn insert(pool: &AnyPool, k: &ApiKey) -> Result<()> {
         sqlx::query(
-            "INSERT INTO api_keys (id, key, name, status, quota, expired_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO api_keys (id, key, name, status, quota, expired_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(&k.id)
         .bind(&k.key)
@@ -306,7 +306,7 @@ impl ApiKeyRepo {
     }
 
     pub async fn get_by_key(pool: &AnyPool, key: &str) -> Result<Option<ApiKey>> {
-        sqlx::query_as::<_, ApiKey>("SELECT * FROM api_keys WHERE key = ?")
+        sqlx::query_as::<_, ApiKey>("SELECT * FROM api_keys WHERE key = $1")
             .bind(key)
             .fetch_optional(pool)
             .await
@@ -314,7 +314,7 @@ impl ApiKeyRepo {
     }
 
     pub async fn update_status(pool: &AnyPool, id: &str, status: &str) -> Result<()> {
-        sqlx::query("UPDATE api_keys SET status = ?, updated_at = ? WHERE id = ?")
+        sqlx::query("UPDATE api_keys SET status = $1, updated_at = $2 WHERE id = $3")
             .bind(status)
             .bind(now())
             .bind(id)
@@ -331,7 +331,7 @@ impl ApiKeyRepo {
     }
 
     pub async fn delete(pool: &AnyPool, id: &str) -> Result<()> {
-        sqlx::query("DELETE FROM api_keys WHERE id = ?")
+        sqlx::query("DELETE FROM api_keys WHERE id = $1")
             .bind(id)
             .execute(pool)
             .await?;
@@ -352,7 +352,7 @@ impl ModelPriceRepo {
         // COALESCE normalizes NULL channel_id so the unique index catches conflicts on both backends.
         let res = sqlx::query(
             "INSERT INTO model_prices (id, channel_id, model, price, reference_id, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
              ON CONFLICT (COALESCE(channel_id, ''), model) DO UPDATE SET \
              price = excluded.price, reference_id = excluded.reference_id, updated_at = excluded.updated_at",
         )
@@ -373,7 +373,7 @@ impl ModelPriceRepo {
     pub async fn find(pool: &AnyPool, channel_id: Option<&str>, model: &str) -> Result<Option<ModelPrice>> {
         if let Some(cid) = channel_id {
             let row = sqlx::query_as::<_, ModelPrice>(
-                "SELECT * FROM model_prices WHERE channel_id = ? AND model = ?",
+                "SELECT * FROM model_prices WHERE channel_id = $1 AND model = $2",
             )
             .bind(cid)
             .bind(model)
@@ -384,7 +384,7 @@ impl ModelPriceRepo {
             }
         }
         sqlx::query_as::<_, ModelPrice>(
-            "SELECT * FROM model_prices WHERE channel_id IS NULL AND model = ?",
+            "SELECT * FROM model_prices WHERE channel_id IS NULL AND model = $1",
         )
         .bind(model)
         .fetch_optional(pool)
@@ -400,7 +400,7 @@ impl ModelPriceRepo {
     }
 
     pub async fn delete(pool: &AnyPool, id: &str) -> Result<()> {
-        sqlx::query("DELETE FROM model_prices WHERE id = ?")
+        sqlx::query("DELETE FROM model_prices WHERE id = $1")
             .bind(id)
             .execute(pool)
             .await?;
@@ -416,7 +416,7 @@ impl UsageLogRepo {
     pub async fn insert(pool: &AnyPool, log: &UsageLog) -> Result<()> {
         sqlx::query(
             "INSERT INTO usage_logs (id, request_id, api_key_id, channel_id, model, stream, prompt_tokens, completion_tokens, cached_tokens, reasoning_tokens, total_tokens, cost, cost_items, status, latency_ms, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
         )
         .bind(&log.id)
         .bind(&log.request_id)
@@ -446,17 +446,22 @@ impl UsageLogRepo {
         since: Option<&str>,
         limit: u32,
     ) -> Result<Vec<UsageLog>> {
+        // $n placeholders: portable across postgres (native) and sqlite ($name form).
         let mut sql = String::from("SELECT * FROM usage_logs WHERE 1=1");
+        let mut n = 0;
         if api_key_id.is_some() {
-            sql.push_str(" AND api_key_id = ?");
+            n += 1;
+            sql.push_str(&format!(" AND api_key_id = ${n}"));
         }
         if channel_id.is_some() {
-            sql.push_str(" AND channel_id = ?");
+            n += 1;
+            sql.push_str(&format!(" AND channel_id = ${n}"));
         }
         if since.is_some() {
-            sql.push_str(" AND created_at >= ?");
+            n += 1;
+            sql.push_str(&format!(" AND created_at >= ${n}"));
         }
-        sql.push_str(" ORDER BY created_at DESC LIMIT ?");
+        sql.push_str(&format!(" ORDER BY created_at DESC LIMIT ${}", n + 1));
 
         let mut q = sqlx::query_as::<Any, UsageLog>(&sql);
         if let Some(v) = api_key_id {
@@ -480,7 +485,7 @@ impl UsageLogRepo {
         // SUM over TEXT cost would need a CAST that differs between backends;
         // instead fetch the cost column and sum in Rust with rust_decimal.
         let row: Vec<(i64, i64, String)> = sqlx::query_as(
-            "SELECT total_tokens, 0, cost FROM usage_logs WHERE api_key_id = ? AND created_at >= ?",
+            "SELECT total_tokens, 0, cost FROM usage_logs WHERE api_key_id = $1 AND created_at >= $2",
         )
         .bind(api_key_id)
         .bind(since_rfc3339)
@@ -503,7 +508,7 @@ impl UsageLogRepo {
     pub async fn cost_for_channel_since(pool: &AnyPool, channel_id: &str, since_rfc3339: &str) -> Result<f64> {
         // Same portability reasoning as aggregate_for_key: sum TEXT costs in Rust.
         let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT cost FROM usage_logs WHERE channel_id = ? AND created_at >= ?",
+            "SELECT cost FROM usage_logs WHERE channel_id = $1 AND created_at >= $2",
         )
         .bind(channel_id)
         .bind(since_rfc3339)
@@ -537,7 +542,7 @@ impl ProviderQuotaRepo {
         let ts = now();
         sqlx::query(
             "INSERT INTO provider_quota_status (id, channel_id, provider_type, account_key, status, quota_data, next_check_at, next_reset_at, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
              ON CONFLICT (channel_id, provider_type, account_key) DO UPDATE SET \
              status = excluded.status, quota_data = excluded.quota_data, next_check_at = excluded.next_check_at, next_reset_at = excluded.next_reset_at, updated_at = excluded.updated_at",
         )
@@ -559,7 +564,7 @@ impl ProviderQuotaRepo {
     /// Rows with next_check_at NULL or <= now (RFC3339 strings compare lexicographically).
     pub async fn list_due(pool: &AnyPool, now_rfc3339: &str) -> Result<Vec<ProviderQuotaStatus>> {
         sqlx::query_as::<_, ProviderQuotaStatus>(
-            "SELECT * FROM provider_quota_status WHERE next_check_at IS NULL OR next_check_at <= ?",
+            "SELECT * FROM provider_quota_status WHERE next_check_at IS NULL OR next_check_at <= $1",
         )
         .bind(now_rfc3339)
         .fetch_all(pool)
@@ -569,7 +574,7 @@ impl ProviderQuotaRepo {
 
     pub async fn list_for_channel(pool: &AnyPool, channel_id: &str) -> Result<Vec<ProviderQuotaStatus>> {
         sqlx::query_as::<_, ProviderQuotaStatus>(
-            "SELECT * FROM provider_quota_status WHERE channel_id = ?",
+            "SELECT * FROM provider_quota_status WHERE channel_id = $1",
         )
         .bind(channel_id)
         .fetch_all(pool)

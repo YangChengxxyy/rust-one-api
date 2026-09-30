@@ -300,6 +300,34 @@ mod tests {
         assert_eq!(r.choices[0].message.content.as_ref().unwrap().text(), "hello");
     }
 
+    /// Regression: CC stream tool_call deltas after the first carry neither
+    /// id nor type (only index + arguments fragment) — must not fail parsing.
+    #[test]
+    fn stream_tool_call_continuation_deltas_parse() {
+        let t = OpenAiOutbound::new();
+        let first = SseEvent::data(r#"{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}"#);
+        let chunks = t.transform_stream_event(&first).unwrap();
+        let tc = &chunks[0].choices[0].delta.tool_calls.as_ref().unwrap()[0];
+        assert_eq!(tc.id, "call_a");
+        assert_eq!(tc.index, Some(0));
+        assert_eq!(tc.function.name, "get_weather");
+
+        let cont = SseEvent::data(r#"{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"ci"}}]},"finish_reason":null}]}"#);
+        let chunks = t.transform_stream_event(&cont).unwrap();
+        let tc = &chunks[0].choices[0].delta.tool_calls.as_ref().unwrap()[0];
+        assert_eq!(tc.id, "");
+        assert_eq!(tc.index, Some(0));
+        assert_eq!(tc.function.name, "");
+        assert_eq!(tc.function.arguments, "{\"ci");
+
+        // A second parallel call distinguished by index.
+        let second = SseEvent::data(r#"{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"f2","arguments":""}}]},"finish_reason":null}]}"#);
+        let chunks = t.transform_stream_event(&second).unwrap();
+        let tc = &chunks[0].choices[0].delta.tool_calls.as_ref().unwrap()[0];
+        assert_eq!(tc.id, "call_b");
+        assert_eq!(tc.index, Some(1));
+    }
+
     #[test]
     fn stream_done_sentinel_and_chunk() {
         let t = OpenAiOutbound::new();

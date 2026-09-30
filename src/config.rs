@@ -10,6 +10,27 @@ pub struct Config {
     pub log: String,
     /// Admin API bearer token for management endpoints.
     pub admin_token: Option<String>,
+    #[serde(default)]
+    pub trace: TraceConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TraceConfig {
+    /// off | meta | full. `meta` writes request summary + per-attempt
+    /// metadata only; `full` additionally stores sanitized/truncated
+    /// headers and bodies.
+    #[serde(default = "default_trace_level")]
+    pub level: String,
+}
+
+impl Default for TraceConfig {
+    fn default() -> Self {
+        Self { level: default_trace_level() }
+    }
+}
+
+fn default_trace_level() -> String {
+    "meta".to_string()
 }
 
 fn default_listen() -> String {
@@ -44,6 +65,9 @@ impl Config {
         if let Ok(v) = std::env::var("ROA_ADMIN_TOKEN") {
             cfg.admin_token = Some(v);
         }
+        if let Ok(v) = std::env::var("ROA_TRACE_LEVEL") {
+            cfg.trace.level = v;
+        }
         Ok(cfg)
     }
 }
@@ -59,5 +83,12 @@ mod tests {
         assert_eq!(cfg.database_url, "sqlite://rust-one-api.db");
         assert_eq!(cfg.log, "info");
         assert!(cfg.admin_token.is_none());
+        assert_eq!(cfg.trace.level, "meta");
+    }
+
+    #[test]
+    fn trace_level_parses_from_yaml() {
+        let cfg: Config = serde_yaml::from_str("trace:\n  level: full").unwrap();
+        assert_eq!(cfg.trace.level, "full");
     }
 }

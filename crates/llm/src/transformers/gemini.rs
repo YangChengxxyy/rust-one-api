@@ -226,6 +226,7 @@ fn gemini_to_unified(body: &[u8]) -> Result<Request, TransformError> {
                 calls.push(ToolCall {
                     id,
                     kind: "function".into(),
+                    index: None,
                     function: FunctionCall {
                         name: fc.get("name").and_then(Value::as_str).unwrap_or_default().to_string(),
                         arguments: serde_json::to_string(&args).unwrap_or_else(|_| "{}".into()),
@@ -302,6 +303,7 @@ fn gemini_chunk_to_unified(v: &Value) -> StreamChunk {
                 tool_calls.push(ToolCall {
                     id,
                     kind: "function".into(),
+                    index: None,
                     function: FunctionCall {
                         name: fc.get("name").and_then(Value::as_str).unwrap_or_default().to_string(),
                         arguments: serde_json::to_string(&fc.get("args").cloned().unwrap_or(json!({})))

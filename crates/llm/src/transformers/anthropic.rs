@@ -273,6 +273,7 @@ fn anthropic_to_unified(body: &[u8]) -> Result<Request, TransformError> {
                     msg.tool_calls.get_or_insert_with(Vec::new).push(ToolCall {
                         id: b.get("id").and_then(Value::as_str).unwrap_or_default().to_string(),
                         kind: "function".into(),
+                        index: None,
                         function: FunctionCall {
                             name: b.get("name").and_then(Value::as_str).unwrap_or_default().to_string(),
                             arguments: serde_json::to_string(&input).unwrap_or_else(|_| "{}".into()),
@@ -370,7 +371,18 @@ struct InboundStreamState {
 
 enum OpenBlock {
     Text { index: u32 },
-    Tool { index: u32 },
+    Tool { index: u32, id: String, src_index: Option<u32> },
+}
+
+/// Whether an incoming tool_call delta continues the open tool block.
+/// Continuation: same source index when both carry one, else empty id
+/// (CC argument-continuation deltas) or matching id. A different non-empty
+/// id or mismatched index starts a new block.
+fn continues_tool_block(open_id: &str, open_src: Option<u32>, tc: &ToolCall) -> bool {
+    if let (Some(a), Some(b)) = (tc.index, open_src) {
+        return a == b;
+    }
+    tc.id.is_empty() || tc.id == open_id
 }
 
 impl AnthropicInbound {
@@ -381,12 +393,12 @@ impl AnthropicInbound {
 
 impl AnthropicInbound {
     /// Close the open block if any; returns content_block_stop event.
+    /// `next_index` already advanced when the block was opened, so closing
+    /// must not bump it again — otherwise a second tool call would get a
+    /// gapped (invalid) block index.
     fn close_block(state: &mut InboundStreamState) -> Vec<SseEvent> {
         match state.open.take() {
             Some(block) => {
-                if let OpenBlock::Tool { .. } = block {
-                    state.next_index += 1;
-                }
                 vec![SseEvent::named("content_block_stop", format!(r#"{{"index":{}}}"#, index_of(&block)))]
             }
             None => vec![],
@@ -396,7 +408,7 @@ impl AnthropicInbound {
 
 fn index_of(b: &OpenBlock) -> u32 {
     match b {
-        OpenBlock::Text { index } | OpenBlock::Tool { index } => *index,
+        OpenBlock::Text { index } | OpenBlock::Tool { index, .. } => *index,
     }
 }
 
@@ -508,7 +520,10 @@ impl InboundTransformer for AnthropicInbound {
             }
             for tc in delta.tool_calls.as_deref().unwrap_or(&[]) {
                 match state.open.as_ref() {
-                    Some(OpenBlock::Tool { index }) if *index == state.next_index - 1 => {
+                    Some(OpenBlock::Tool { index, id, src_index })
+                        if *index == state.next_index - 1
+                            && continues_tool_block(id, *src_index, tc) =>
+                    {
                         // continue same tool block (partial arguments)
                         let index = *index;
                         if !tc.function.arguments.is_empty() {
@@ -524,7 +539,7 @@ impl InboundTransformer for AnthropicInbound {
                         events.extend(Self::close_block(&mut state));
                         let index = state.next_index;
                         state.next_index += 1;
-                        state.open = Some(OpenBlock::Tool { index });
+                        state.open = Some(OpenBlock::Tool { index, id: tc.id.clone(), src_index: tc.index });
                         events.push(SseEvent::named(
                             "content_block_start",
                             json!({"type":"content_block_start","index":index,
@@ -654,6 +669,7 @@ impl OutboundTransformer for AnthropicOutbound {
                 Some("tool_use") => message.tool_calls.get_or_insert_with(Vec::new).push(ToolCall {
                     id: b.get("id").and_then(Value::as_str).unwrap_or_default().to_string(),
                     kind: "function".into(),
+                    index: None,
                     function: FunctionCall {
                         name: b.get("name").and_then(Value::as_str).unwrap_or_default().to_string(),
                         arguments: serde_json::to_string(
@@ -723,6 +739,7 @@ impl OutboundTransformer for AnthropicOutbound {
                             tool_calls: Some(vec![ToolCall {
                                 id,
                                 kind: "function".into(),
+                                index: Some(index as u32),
                                 function: FunctionCall { name, arguments: String::new() },
                             }]),
                         },
@@ -762,6 +779,7 @@ impl OutboundTransformer for AnthropicOutbound {
                                 tool_calls: Some(vec![ToolCall {
                                     id,
                                     kind: "function".into(),
+                                    index: Some(index as u32),
                                     function: FunctionCall {
                                         name,
                                         arguments: v
@@ -1007,6 +1025,7 @@ mod tests {
         chunk.choices[0].delta.tool_calls = Some(vec![ToolCall {
             id: "t1".into(),
             kind: "function".into(),
+            index: None,
             function: FunctionCall { name: "f".into(), arguments: "{\"x\":".into() },
         }]);
         let mut evs = t.transform_stream_chunk(&chunk).unwrap();
@@ -1036,6 +1055,73 @@ mod tests {
         assert_eq!(d2["delta"]["partial_json"], "1}");
         let md: Value = serde_json::from_str(&evs[5].data).unwrap();
         assert_eq!(md["delta"]["stop_reason"], "tool_use");
+    }
+
+    /// Regression: a second tool call (different id / different source index)
+    /// must open a new content_block instead of appending to the open one,
+    /// and interleaved argument deltas must route by source index.
+    #[test]
+    fn inbound_stream_two_tool_calls_open_separate_blocks() {
+        let t = AnthropicInbound::new();
+        let tool_chunk = |tc: ToolCall| {
+            let mut c = text_chunk("m2", "");
+            c.choices[0].delta.content = None;
+            c.choices[0].delta.tool_calls = Some(vec![tc]);
+            c
+        };
+        let tc = |id: &str, index: Option<u32>, name: &str, args: &str| ToolCall {
+            id: id.into(),
+            kind: "function".into(),
+            index,
+            function: FunctionCall { name: name.into(), arguments: args.into() },
+        };
+        let mut evs = Vec::new();
+        evs.extend(t.transform_stream_chunk(&tool_chunk(tc("t1", Some(0), "f1", "{\"x\":"))).unwrap());
+        evs.extend(t.transform_stream_chunk(&tool_chunk(tc("", Some(0), "", "1}"))).unwrap());
+        evs.extend(t.transform_stream_chunk(&tool_chunk(tc("t2", Some(1), "f2", "{\"y\":"))).unwrap());
+        evs.extend(t.transform_stream_chunk(&tool_chunk(tc("", Some(1), "", "2}"))).unwrap());
+        let mut fin = text_chunk("m2", "");
+        fin.choices[0].delta.content = None;
+        fin.choices[0].finish_reason = Some("tool_calls".into());
+        evs.extend(t.transform_stream_chunk(&fin).unwrap());
+        evs.extend(t.stream_end());
+
+        let names: Vec<&str> = evs.iter().map(|e| e.event.as_deref().unwrap()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "message_start",
+                "content_block_start", // t1 @0
+                "content_block_delta",
+                "content_block_delta", // "1}" -> t1
+                "content_block_stop",  // t1 closed
+                "content_block_start", // t2 @1
+                "content_block_delta",
+                "content_block_delta", // "2}" -> t2
+                "content_block_stop",
+                "message_delta",
+                "message_stop"
+            ]
+        );
+        let starts: Vec<Value> = evs
+            .iter()
+            .filter(|e| e.event.as_deref() == Some("content_block_start"))
+            .map(|e| serde_json::from_str(&e.data).unwrap())
+            .collect();
+        assert_eq!(starts[0]["content_block"]["id"], "t1");
+        assert_eq!(starts[0]["index"], 0);
+        assert_eq!(starts[1]["content_block"]["id"], "t2");
+        assert_eq!(starts[1]["index"], 1);
+        // interleaved deltas land in the right blocks
+        let deltas: Vec<Value> = evs
+            .iter()
+            .filter(|e| e.event.as_deref() == Some("content_block_delta"))
+            .map(|e| serde_json::from_str(&e.data).unwrap())
+            .collect();
+        assert_eq!(deltas[1]["index"], 0);
+        assert_eq!(deltas[1]["delta"]["partial_json"], "1}");
+        assert_eq!(deltas[3]["index"], 1);
+        assert_eq!(deltas[3]["delta"]["partial_json"], "2}");
     }
 
     #[test]

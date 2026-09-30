@@ -128,6 +128,38 @@ pub struct UsageLog {
 }
 
 #[derive(Debug, Clone)]
+pub struct TraceRequest {
+    pub id: String,
+    pub api_key_id: Option<String>,
+    pub channel_id: Option<String>,
+    pub model: String,
+    pub stream: bool,
+    pub status: String,
+    pub error: Option<String>,
+    pub ttft_ms: Option<i64>,
+    pub latency_ms: i64,
+    pub usage: String,
+    pub cost: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TraceExecution {
+    pub id: String,
+    pub request_id: String,
+    pub attempt: i64,
+    pub channel_id: String,
+    pub status: String,
+    pub error: Option<String>,
+    pub latency_ms: i64,
+    pub request_headers: Option<String>,
+    pub request_body: Option<String>,
+    pub response_headers: Option<String>,
+    pub response_body: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ProviderQuotaStatus {
     pub id: String,
     pub channel_id: String,
@@ -184,6 +216,29 @@ impl<'r> FromRow<'r, sqlx::any::AnyRow> for UsageLog {
     }
 }
 impl_from_row!(ProviderQuotaStatus { id, channel_id, provider_type, account_key, status, quota_data, next_check_at, next_reset_at, created_at, updated_at });
+// TraceRequest.stream: same sqlite-INTEGER/postgres-BOOLEAN split as UsageLog.
+impl<'r> FromRow<'r, sqlx::any::AnyRow> for TraceRequest {
+    fn from_row(row: &'r sqlx::any::AnyRow) -> Result<Self, sqlx::Error> {
+        let stream = row
+            .try_get::<bool, _>("stream")
+            .or_else(|_| row.try_get::<i64, _>("stream").map(|v| v != 0))?;
+        Ok(TraceRequest {
+            id: row.try_get("id")?,
+            api_key_id: row.try_get("api_key_id")?,
+            channel_id: row.try_get("channel_id")?,
+            model: row.try_get("model")?,
+            stream,
+            status: row.try_get("status")?,
+            error: row.try_get("error")?,
+            ttft_ms: row.try_get("ttft_ms")?,
+            latency_ms: row.try_get("latency_ms")?,
+            usage: row.try_get("usage")?,
+            cost: row.try_get("cost")?,
+            created_at: row.try_get("created_at")?,
+        })
+    }
+}
+impl_from_row!(TraceExecution { id, request_id, attempt, channel_id, status, error, latency_ms, request_headers, request_body, response_headers, response_body, created_at });
 
 // ---------- ChannelRepo ----------
 
@@ -524,6 +579,142 @@ impl UsageLogRepo {
     }
 }
 
+// ---------- TraceRepo ----------
+
+/// Filters for `GET /admin/traces`; all optional except pagination.
+#[derive(Debug, Default)]
+pub struct TraceFilter {
+    pub api_key_id: Option<String>,
+    pub channel_id: Option<String>,
+    pub model: Option<String>,
+    pub status: Option<String>,
+    pub since: Option<String>,
+    pub until: Option<String>,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+pub struct TraceRepo;
+
+impl TraceRepo {
+    pub async fn insert_request(pool: &AnyPool, row: &TraceRequest) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO requests (id, api_key_id, channel_id, model, stream, status, error, ttft_ms, latency_ms, usage, cost, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+        )
+        .bind(&row.id)
+        .bind(&row.api_key_id)
+        .bind(&row.channel_id)
+        .bind(&row.model)
+        .bind(row.stream)
+        .bind(&row.status)
+        .bind(&row.error)
+        .bind(row.ttft_ms)
+        .bind(row.latency_ms)
+        .bind(&row.usage)
+        .bind(&row.cost)
+        .bind(&row.created_at)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn insert_executions(pool: &AnyPool, rows: &[TraceExecution]) -> Result<()> {
+        for row in rows {
+            sqlx::query(
+                "INSERT INTO request_executions (id, request_id, attempt, channel_id, status, error, latency_ms, request_headers, request_body, response_headers, response_body, created_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+            )
+            .bind(&row.id)
+            .bind(&row.request_id)
+            .bind(row.attempt)
+            .bind(&row.channel_id)
+            .bind(&row.status)
+            .bind(&row.error)
+            .bind(row.latency_ms)
+            .bind(&row.request_headers)
+            .bind(&row.request_body)
+            .bind(&row.response_headers)
+            .bind(&row.response_body)
+            .bind(&row.created_at)
+            .execute(pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn list_filtered(pool: &AnyPool, f: &TraceFilter) -> Result<Vec<TraceRequest>> {
+        // $n placeholders: portable across postgres (native) and sqlite ($name form).
+        let mut sql = String::from("SELECT * FROM requests WHERE 1=1");
+        let mut n = 0;
+        if f.api_key_id.is_some() {
+            n += 1;
+            sql.push_str(&format!(" AND api_key_id = ${n}"));
+        }
+        if f.channel_id.is_some() {
+            n += 1;
+            sql.push_str(&format!(" AND channel_id = ${n}"));
+        }
+        if f.model.is_some() {
+            n += 1;
+            sql.push_str(&format!(" AND model = ${n}"));
+        }
+        if f.status.is_some() {
+            n += 1;
+            sql.push_str(&format!(" AND status = ${n}"));
+        }
+        if f.since.is_some() {
+            n += 1;
+            sql.push_str(&format!(" AND created_at >= ${n}"));
+        }
+        if f.until.is_some() {
+            n += 1;
+            sql.push_str(&format!(" AND created_at <= ${n}"));
+        }
+        sql.push_str(&format!(" ORDER BY created_at DESC LIMIT ${} OFFSET ${}", n + 1, n + 2));
+
+        let mut q = sqlx::query_as::<Any, TraceRequest>(&sql);
+        if let Some(v) = &f.api_key_id {
+            q = q.bind(v);
+        }
+        if let Some(v) = &f.channel_id {
+            q = q.bind(v);
+        }
+        if let Some(v) = &f.model {
+            q = q.bind(v);
+        }
+        if let Some(v) = &f.status {
+            q = q.bind(v);
+        }
+        if let Some(v) = &f.since {
+            q = q.bind(v);
+        }
+        if let Some(v) = &f.until {
+            q = q.bind(v);
+        }
+        q = q.bind(f.limit).bind(f.offset);
+        q.fetch_all(pool).await.map_err(Into::into)
+    }
+
+    pub async fn get_request(pool: &AnyPool, id: &str) -> Result<Option<TraceRequest>> {
+        sqlx::query_as::<_, TraceRequest>("SELECT * FROM requests WHERE id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn list_executions(pool: &AnyPool, request_id: &str) -> Result<Vec<TraceExecution>> {
+        sqlx::query_as::<_, TraceExecution>(
+            "SELECT * FROM request_executions WHERE request_id = $1 ORDER BY attempt",
+        )
+        .bind(request_id)
+        .fetch_all(pool)
+        .await
+        .map_err(Into::into)
+    }
+}
+
 // ---------- ProviderQuotaRepo ----------
 
 pub struct ProviderQuotaRepo;
@@ -746,6 +937,87 @@ mod tests {
         let (count, _, _) =
             UsageLogRepo::aggregate_for_key(&db, "k1", "2026-01-02T00:00:00+00:00").await.unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_traces() {
+        let db = test_db().await;
+        let req = |id: &str, key: Option<&str>, ch: Option<&str>, status: &str, day: &str| TraceRequest {
+            id: id.into(),
+            api_key_id: key.map(str::to_string),
+            channel_id: ch.map(str::to_string),
+            model: "gpt-4o".into(),
+            stream: true,
+            status: status.into(),
+            error: (status == "failed").then(|| "boom".to_string()),
+            ttft_ms: Some(120),
+            latency_ms: 800,
+            usage: r#"{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}"#.into(),
+            cost: "0.001".into(),
+            created_at: format!("2026-01-{day}T00:00:00+00:00"),
+        };
+        TraceRepo::insert_request(&db, &req("r1", Some("k1"), Some("c1"), "success", "01")).await.unwrap();
+        TraceRepo::insert_request(&db, &req("r2", Some("k1"), Some("c2"), "failed", "02")).await.unwrap();
+        TraceRepo::insert_request(&db, &req("r3", Some("k2"), None, "success", "03")).await.unwrap();
+        let exec = |id: &str, req_id: &str, attempt: i64, ch: &str, status: &str| TraceExecution {
+            id: id.into(),
+            request_id: req_id.into(),
+            attempt,
+            channel_id: ch.into(),
+            status: status.into(),
+            error: (status == "failed").then(|| "upstream 500".to_string()),
+            latency_ms: 100 * attempt,
+            request_headers: Some(r#"{"authorization":"***"}"#.into()),
+            request_body: Some("{}".into()),
+            response_headers: None,
+            response_body: Some("data: ...".into()),
+            created_at: now(),
+        };
+        TraceRepo::insert_executions(&db, &[
+            exec("e1", "r1", 1, "c0", "failed"),
+            exec("e2", "r1", 2, "c1", "success"),
+        ])
+        .await
+        .unwrap();
+
+        // round-trip incl. bool stream + Option fields
+        let got = TraceRepo::get_request(&db, "r1").await.unwrap().unwrap();
+        assert!(got.stream);
+        assert_eq!(got.ttft_ms, Some(120));
+        assert_eq!(got.status, "success");
+        assert!(got.error.is_none());
+
+        // executions come back ordered by attempt
+        let execs = TraceRepo::list_executions(&db, "r1").await.unwrap();
+        assert_eq!(execs.len(), 2);
+        assert_eq!(execs[0].attempt, 1);
+        assert_eq!(execs[0].status, "failed");
+        assert_eq!(execs[1].attempt, 2);
+        assert_eq!(execs[1].channel_id, "c1");
+
+        // filters
+        let by_key = TraceRepo::list_filtered(&db, &TraceFilter {
+            api_key_id: Some("k1".into()), limit: 10, ..Default::default()
+        }).await.unwrap();
+        assert_eq!(by_key.len(), 2);
+        let by_status = TraceRepo::list_filtered(&db, &TraceFilter {
+            status: Some("failed".into()), limit: 10, ..Default::default()
+        }).await.unwrap();
+        assert_eq!(by_status.len(), 1);
+        assert_eq!(by_status[0].id, "r2");
+        let by_time = TraceRepo::list_filtered(&db, &TraceFilter {
+            since: Some("2026-01-02T00:00:00+00:00".into()),
+            until: Some("2026-01-02T23:59:59+00:00".into()),
+            limit: 10, ..Default::default()
+        }).await.unwrap();
+        assert_eq!(by_time.len(), 1);
+        assert_eq!(by_time[0].id, "r2");
+        // pagination: newest first, offset skips it
+        let page = TraceRepo::list_filtered(&db, &TraceFilter {
+            limit: 1, offset: 1, ..Default::default()
+        }).await.unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, "r2");
     }
 
     #[tokio::test]

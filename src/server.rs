@@ -20,8 +20,9 @@ use crate::orchestrator::{Relay, RelayOutcome};
 use crate::provider_quota::check_channel;
 use crate::storage::{
     ApiKey, ApiKeyRepo, Channel, ChannelRepo, Db, ModelPriceRepo, ProviderQuotaRepo,
-    UsageLogRepo,
+    TraceFilter, TraceRepo, UsageLogRepo,
 };
+use crate::trace::TraceLevel;
 
 struct AppState {
     relay: Relay,
@@ -33,7 +34,7 @@ struct AppState {
 pub async fn run(cfg: Config, pool: Db) -> anyhow::Result<()> {
     let http = reqwest::Client::new();
     let state = Arc::new(AppState {
-        relay: Relay::new(pool.clone()),
+        relay: Relay::new(pool.clone(), TraceLevel::parse(&cfg.trace.level)),
         pool,
         admin_token: cfg.admin_token.clone(),
         http,
@@ -41,6 +42,7 @@ pub async fn run(cfg: Config, pool: Db) -> anyhow::Result<()> {
 
     let relay_routes = Router::new()
         .route("/v1/chat/completions", post(relay_openai))
+        .route("/v1/responses", post(relay_responses))
         .route("/v1/messages", post(relay_claude))
         .route("/anthropic/v1/messages", post(relay_claude))
         .route("/gemini/{ver}/models/{model_action}", post(relay_gemini))
@@ -57,6 +59,8 @@ pub async fn run(cfg: Config, pool: Db) -> anyhow::Result<()> {
         .route("/prices", post(admin_upsert_price).get(admin_list_prices))
         .route("/prices/{id}", delete(admin_delete_price))
         .route("/usage", get(admin_usage))
+        .route("/traces", get(admin_traces))
+        .route("/traces/{id}", get(admin_trace_detail))
         .route("/quota", get(admin_quota))
         .route("/quota/check", post(admin_quota_check))
         .route("/channels/{id}/quota/resets", get(admin_channel_quota_resets))
@@ -197,6 +201,22 @@ async fn relay_claude(
     let outcome = state
         .relay
         .relay("claude/messages", None, false, &api_key, &body)
+        .await?;
+    Ok(outcome_to_response(outcome))
+}
+
+async fn relay_responses(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    req: Request,
+) -> Result<Response, AppError> {
+    let body = axum::body::to_bytes(req.into_body(), 32 * 1024 * 1024)
+        .await
+        .map_err(|e| AppError::bad_request(format!("read body: {e}")))?;
+    let api_key = authenticate(&state, &headers, None).await?;
+    let outcome = state
+        .relay
+        .relay("openai/responses", None, false, &api_key, &body)
         .await?;
     Ok(outcome_to_response(outcome))
 }
@@ -480,6 +500,72 @@ async fn admin_usage(
         }))
         .collect::<Vec<_>>()))
     .into_response())
+}
+
+fn trace_request_json(r: &crate::storage::TraceRequest) -> Value {
+    json!({
+        "id": r.id, "api_key_id": r.api_key_id, "channel_id": r.channel_id,
+        "model": r.model, "stream": r.stream, "status": r.status,
+        "error": r.error, "ttft_ms": r.ttft_ms, "latency_ms": r.latency_ms,
+        "usage": serde_json::from_str::<Value>(&r.usage).unwrap_or(json!({})),
+        "cost": r.cost, "created_at": r.created_at,
+    })
+}
+
+/// `GET /admin/traces`: request summaries, filterable by
+/// api_key_id/channel_id/model/status/since/until, paginated via limit/offset.
+async fn admin_traces(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Result<Response, AppError> {
+    let filter = TraceFilter {
+        api_key_id: q.get("api_key_id").cloned(),
+        channel_id: q.get("channel_id").cloned(),
+        model: q.get("model").cloned(),
+        status: q.get("status").cloned(),
+        since: q.get("since").cloned(),
+        until: q.get("until").cloned(),
+        limit: q
+            .get("limit")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(100)
+            .clamp(1, 1000),
+        offset: q
+            .get("offset")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0)
+            .max(0),
+    };
+    let rows = TraceRepo::list_filtered(&state.pool, &filter).await?;
+    Ok(Json(json!(rows.iter().map(trace_request_json).collect::<Vec<_>>())).into_response())
+}
+
+/// `GET /admin/traces/{id}`: one request plus its per-attempt executions.
+async fn admin_trace_detail(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Response, AppError> {
+    let Some(req) = TraceRepo::get_request(&state.pool, &id).await? else {
+        return Err(AppError::not_found(format!("trace {id} not found")));
+    };
+    let executions = TraceRepo::list_executions(&state.pool, &id).await?;
+    let mut out = trace_request_json(&req);
+    out["executions"] = json!(executions
+        .iter()
+        .map(|e| json!({
+            "id": e.id, "request_id": e.request_id, "attempt": e.attempt,
+            "channel_id": e.channel_id, "status": e.status, "error": e.error,
+            "latency_ms": e.latency_ms,
+            "request_headers": e.request_headers.as_deref()
+                .and_then(|s| serde_json::from_str::<Value>(s).ok()),
+            "request_body": e.request_body,
+            "response_headers": e.response_headers.as_deref()
+                .and_then(|s| serde_json::from_str::<Value>(s).ok()),
+            "response_body": e.response_body,
+            "created_at": e.created_at,
+        }))
+        .collect::<Vec<_>>());
+    Ok(Json(out).into_response())
 }
 
 async fn admin_quota(

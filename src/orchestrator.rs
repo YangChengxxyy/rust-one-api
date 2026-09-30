@@ -35,6 +35,7 @@ use crate::storage::{
     ApiKey, Channel, ChannelRepo, Db, ModelPriceRepo, ProviderQuotaRepo, UsageLog,
     UsageLogRepo,
 };
+use crate::trace::{PendingAttempt, RequestTracer, TraceLevel, TraceOutcome};
 
 /// Result of a relay dispatch.
 pub enum RelayOutcome {
@@ -78,13 +79,15 @@ impl UpstreamFailure {
 pub struct Relay {
     pool: Db,
     http: reqwest::Client,
+    trace_level: TraceLevel,
 }
 
 impl Relay {
-    pub fn new(pool: Db) -> Self {
+    pub fn new(pool: Db, trace_level: TraceLevel) -> Self {
         Self {
             pool,
             http: reqwest::Client::new(),
+            trace_level,
         }
     }
 
@@ -162,6 +165,12 @@ impl Relay {
         candidates.truncate(3);
 
         let started = Instant::now();
+        let mut tracer = RequestTracer::new(
+            self.trace_level,
+            Some(api_key.id.clone()),
+            requested_model.clone(),
+            req.stream,
+        );
         let mut last_err = String::from("unknown error");
         let mut skipped_disabled: Vec<String> = Vec::new();
         for channel in &candidates {
@@ -230,7 +239,7 @@ impl Relay {
                     break;
                 }
                 match self
-                    .try_channel(&ch, &key, &req, &requested_model, api_key, inbound_format)
+                    .try_channel(&ch, &key, &req, &requested_model, api_key, inbound_format, &mut tracer)
                     .await
                 {
                     Ok(outcome) => {
@@ -283,7 +292,7 @@ impl Relay {
             }
         }
         // All candidates failed: log once (last channel), then surface upstream error.
-        write_billing(
+        let cost = write_billing(
             &self.pool,
             Some(api_key.id.as_str()),
             candidates.last(),
@@ -292,9 +301,19 @@ impl Relay {
             &Usage::default(),
             "failed",
             started,
-            &Uuid::new_v4().to_string(),
+            tracer.request_id(),
         )
         .await;
+        tracer.submit(
+            &self.pool,
+            TraceOutcome {
+                status: "failed",
+                error: Some(last_err.clone()),
+                channel_id: None,
+                usage: &Usage::default(),
+                cost,
+            },
+        );
         if !skipped_disabled.is_empty() && skipped_disabled.len() == candidates.len() {
             return Err(AppError::not_found(format!(
                 "no channel available for model {requested_model}: all {} candidate(s) auto-disabled: {}",
@@ -365,6 +384,7 @@ impl Relay {
         requested_model: &str,
         api_key: &ApiKey,
         inbound_format: &str,
+        tracer: &mut RequestTracer,
     ) -> Result<RelayOutcome, UpstreamFailure> {
         // Fresh inbound instance per attempt: instances are per-request and
         // may be stateful (e.g. Anthropic content_block lifecycle).
@@ -399,37 +419,49 @@ impl Relay {
         for (k, v) in &out_req.headers {
             http_req = http_req.header(k, v);
         }
-        let resp = http_req
-            .body(out_req.body)
-            .send()
-            .await
-            .map_err(|e| UpstreamFailure::network(format!("network: {e}")))?;
+        let mut pending = tracer.begin_attempt(&channel.id);
+        pending.capture_request(&out_req.headers, &out_req.body);
+        let resp = match http_req.body(out_req.body).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                let msg = format!("network: {e}");
+                tracer.record_attempt(pending, "failed", Some(msg.clone()));
+                return Err(UpstreamFailure::network(msg));
+            }
+        };
+        pending.capture_response_headers(resp.headers());
 
         let status = resp.status().as_u16();
         if status >= 500 {
             let body = resp.bytes().await.unwrap_or_default();
-            return Err(UpstreamFailure::network(format!(
-                "upstream {status}: {}",
-                String::from_utf8_lossy(&body)
-            )));
+            pending.set_response_body(&body);
+            let msg = format!("upstream {status}: {}", String::from_utf8_lossy(&body));
+            tracer.record_attempt(pending, "failed", Some(msg.clone()));
+            return Err(UpstreamFailure::network(msg));
         }
         if status == 401 || status == 403 {
             // Auth failure for THIS key: the relay loop disables it and
             // retries the channel with the next key (axonhub disables on
             // 401/403; 429 and other 4xx never disable a key).
             let body = resp.bytes().await.unwrap_or_default();
+            pending.set_response_body(&body);
+            let msg = format!("upstream {status}: {}", String::from_utf8_lossy(&body));
+            tracer.record_attempt(pending, "failed", Some(msg.clone()));
             return Err(UpstreamFailure {
                 status: Some(status),
-                msg: format!("upstream {status}: {}", String::from_utf8_lossy(&body)),
+                msg,
             });
         }
         if status >= 400 {
             // No retry on 4xx; log a failed usage row and surface the error
             // re-encoded in the client's own wire format.
             let body = resp.bytes().await.unwrap_or_default();
+            pending.set_response_body(&body);
+            let msg = format!("upstream {status}: {}", String::from_utf8_lossy(&body));
+            tracer.record_attempt(pending, "failed", Some(msg.clone()));
             let err = outbound.extract_error(status, &body);
             let client_body = inbound.transform_error(&err);
-            write_billing(
+            let cost = write_billing(
                 &self.pool,
                 Some(api_key.id.as_str()),
                 Some(channel),
@@ -438,18 +470,31 @@ impl Relay {
                 &Usage::default(),
                 "failed",
                 Instant::now(),
-                &Uuid::new_v4().to_string(),
+                tracer.request_id(),
             )
             .await;
+            std::mem::take(tracer).submit(
+                &self.pool,
+                TraceOutcome {
+                    status: "failed",
+                    error: Some(msg),
+                    channel_id: Some(channel.id.clone()),
+                    usage: &Usage::default(),
+                    cost,
+                },
+            );
             return Ok(RelayOutcome::Json { status, body: client_body });
         }
 
         if upstream_req.stream {
-            self.stream_response(resp, inbound, outbound, channel, requested_model, api_key, req)
+            // The detached stream task owns the tracer from here on (final
+            // latency/TTFT/usage are only known when the stream ends).
+            let tracer_owned = std::mem::take(tracer);
+            self.stream_response(resp, inbound, outbound, channel, requested_model, api_key, req, tracer_owned, pending)
                 .await
                 .map_err(UpstreamFailure::network)
         } else {
-            self.json_response(resp, inbound, outbound, channel, requested_model, api_key, req)
+            self.json_response(resp, inbound, outbound, channel, requested_model, api_key, req, tracer, pending)
                 .await
                 .map_err(UpstreamFailure::network)
         }
@@ -464,15 +509,23 @@ impl Relay {
         requested_model: &str,
         api_key: &ApiKey,
         req: &Request,
+        tracer: &mut RequestTracer,
+        mut pending: PendingAttempt,
     ) -> Result<RelayOutcome, String> {
         let started = Instant::now();
         let body = resp
             .bytes()
             .await
             .map_err(|e| format!("read upstream body: {e}"))?;
-        let unified = outbound
-            .transform_response(&body)
-            .map_err(|e| format!("bad upstream response: {e}"))?;
+        pending.set_response_body(&body);
+        let unified = match outbound.transform_response(&body) {
+            Ok(u) => u,
+            Err(e) => {
+                let msg = format!("bad upstream response: {e}");
+                tracer.record_attempt(pending, "failed", Some(msg.clone()));
+                return Err(msg);
+            }
+        };
         let usage = if unified.usage.is_some() {
             unified.usage.clone().unwrap_or_default()
         } else {
@@ -490,7 +543,7 @@ impl Relay {
             }
             let usage = token_estimate::final_usage(None, req, &completion);
             tracing::warn!(
-                request_id = %Uuid::new_v4().to_string(),
+                request_id = %tracer.request_id(),
                 model = %requested_model,
                 "non-stream response carried no usage; billing on estimated tokens (prompt={}, completion={})",
                 usage.prompt_tokens,
@@ -498,10 +551,16 @@ impl Relay {
             );
             usage
         };
-        let client_body = inbound
-            .transform_response(&unified)
-            .map_err(|e| format!("encode client response: {e}"))?;
-        write_billing(
+        let client_body = match inbound.transform_response(&unified) {
+            Ok(b) => b,
+            Err(e) => {
+                let msg = format!("encode client response: {e}");
+                tracer.record_attempt(pending, "failed", Some(msg.clone()));
+                return Err(msg);
+            }
+        };
+        tracer.record_attempt(pending, "success", None);
+        let cost = write_billing(
             &self.pool,
             Some(api_key.id.as_str()),
             Some(channel),
@@ -510,9 +569,19 @@ impl Relay {
             &usage,
             "success",
             started,
-            &Uuid::new_v4().to_string(),
+            tracer.request_id(),
         )
         .await;
+        std::mem::take(tracer).submit(
+            &self.pool,
+            TraceOutcome {
+                status: "success",
+                error: None,
+                channel_id: Some(channel.id.clone()),
+                usage: &usage,
+                cost,
+            },
+        );
         Ok(RelayOutcome::Json {
             status: 200,
             body: client_body,
@@ -533,6 +602,8 @@ impl Relay {
         requested_model: &str,
         api_key: &ApiKey,
         req: &Request,
+        tracer: RequestTracer,
+        pending: PendingAttempt,
     ) -> Result<RelayOutcome, String> {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
         let pool = self.pool.clone();
@@ -542,15 +613,21 @@ impl Relay {
         let req = req.clone();
         tokio::spawn(async move {
             let started = Instant::now();
+            let mut tracer = tracer;
+            let mut pending = pending;
             let mut parser = SseParser::new();
             let mut last_usage: Option<Usage> = None;
             let mut completion_text = String::new();
             let mut ok = true;
+            let mut stream_err: Option<String> = None;
             let mut upstream = resp.bytes_stream();
 
             while let Some(item) = upstream.next().await {
                 match item {
                     Ok(bytes) => {
+                        // TTFT: first upstream bytes ~= first token for LLM streams.
+                        tracer.record_ttft();
+                        pending.feed_response_bytes(&bytes);
                         for ev in parser.feed(&bytes) {
                             if let Err(e) = forward_event(
                                 &tx,
@@ -563,6 +640,7 @@ impl Relay {
                             .await
                             {
                                 tracing::warn!("{e}");
+                                stream_err = Some(e);
                                 ok = false;
                             }
                         }
@@ -572,6 +650,7 @@ impl Relay {
                     }
                     Err(e) => {
                         tracing::warn!("upstream stream error: {e}");
+                        stream_err = Some(format!("upstream stream error: {e}"));
                         ok = false;
                         break;
                     }
@@ -590,6 +669,7 @@ impl Relay {
                     .await
                     {
                         tracing::warn!("{e}");
+                        stream_err = Some(e);
                         ok = false;
                     }
                 }
@@ -602,7 +682,7 @@ impl Relay {
                 }
             }
 
-            let request_id = Uuid::new_v4().to_string();
+            let request_id = tracer.request_id().to_string();
             let usage = token_estimate::final_usage(
                 last_usage.as_ref(),
                 &req,
@@ -617,7 +697,12 @@ impl Relay {
                     usage.completion_tokens
                 );
             }
-            write_billing(
+            tracer.record_attempt(
+                pending,
+                if ok { "success" } else { "failed" },
+                stream_err.clone(),
+            );
+            let cost = write_billing(
                 &pool,
                 Some(api_key_id.as_str()),
                 Some(&channel),
@@ -629,6 +714,16 @@ impl Relay {
                 &request_id,
             )
             .await;
+            tracer.submit(
+                &pool,
+                TraceOutcome {
+                    status: if ok { "success" } else { "failed" },
+                    error: stream_err,
+                    channel_id: Some(channel.id.clone()),
+                    usage: &usage,
+                    cost,
+                },
+            );
         });
 
         let client_stream = futures::stream::unfold(rx, |mut rx| async move {
@@ -705,7 +800,7 @@ fn accumulate_completion(chunk: &StreamChunk, buf: &mut String) {
 /// Shared billing writer. Price lookup uses the model as the client requested
 /// it (pre-mapping), channel-specific row first, then global (repo behavior).
 /// If no price row (or unparseable price) exists, the log is still written
-/// with cost 0.
+/// with cost 0. Returns the formatted cost so the trace row can carry it.
 async fn write_billing(
     pool: &Db,
     api_key_id: Option<&str>,
@@ -716,7 +811,7 @@ async fn write_billing(
     status: &str,
     started: Instant,
     request_id: &str,
-) {
+) -> String {
     let mut cost = Decimal::ZERO;
     let mut cost_items: serde_json::Value = serde_json::json!([]);
     if let Some(channel) = channel {
@@ -743,6 +838,7 @@ async fn write_billing(
             }
         }
     }
+    let cost_text = pricing::format_cost(&cost);
     let log = UsageLog {
         id: Uuid::new_v4().to_string(),
         request_id: request_id.to_string(),
@@ -755,7 +851,7 @@ async fn write_billing(
         cached_tokens: usage.cached_tokens.unwrap_or(0) as i64,
         reasoning_tokens: usage.reasoning_tokens.unwrap_or(0) as i64,
         total_tokens: usage.total_tokens as i64,
-        cost: pricing::format_cost(&cost),
+        cost: cost_text.clone(),
         cost_items: cost_items.to_string(),
         status: status.to_string(),
         latency_ms: started.elapsed().as_millis() as i64,
@@ -764,6 +860,7 @@ async fn write_billing(
     if let Err(e) = UsageLogRepo::insert(pool, &log).await {
         tracing::error!("usage log insert failed: {e}");
     }
+    cost_text
 }
 
 #[cfg(test)]

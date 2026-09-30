@@ -1,5 +1,6 @@
 # rust-one-api 配置示例。所有字段可用环境变量覆盖：
-# ROA_LISTEN / ROA_DATABASE_URL / ROA_ADMIN_TOKEN；配置文件路径用 CONFIG_FILE 指定。
+# ROA_LISTEN / ROA_DATABASE_URL / ROA_ADMIN_TOKEN / ROA_TRACE_LEVEL；
+# 配置文件路径用 CONFIG_FILE 指定。
 
 listen: "0.0.0.0:3000"
 
@@ -11,3 +12,8 @@ log: "info"
 
 # 管理 API 的 Bearer token；不设置则 /admin/* 全部 403
 admin_token: "change-me"
+
+# 请求 trace 落库级别：off（不写）| meta（默认，概要+逐次执行元数据，不写 body）
+# | full（另存 headers/body，截断 16 KiB，authorization/x-api-key 脱敏）
+trace:
+  level: "meta"

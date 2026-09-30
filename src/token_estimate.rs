@@ -154,6 +154,7 @@ mod tests {
             tool_calls: Some(vec![ToolCall {
                 id: "t".into(),
                 kind: "function".into(),
+                index: None,
                 function: FunctionCall {
                     name: "do".into(),          // 2 chars -> 1
                     arguments: "{\"a\":1}".into(), // 8 chars -> 2

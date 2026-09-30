@@ -12,7 +12,7 @@ pub async fn probe(http: &reqwest::Client, channel: &Channel, creds: &ChannelCre
     let api_key = creds.api_key.as_deref().unwrap_or_default();
     let base = channel.base_url.trim_end_matches('/');
     let req = match channel.channel_type.as_str() {
-        "openai/chat_completions" | "openai" | "openai_responses" => {
+        "openai/chat_completions" | "openai/responses" | "openai" | "openai_responses" => {
             http.get(format!("{base}/models")).bearer_auth(api_key)
         }
         "claude/messages" => http

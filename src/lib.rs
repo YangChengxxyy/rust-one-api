@@ -9,3 +9,4 @@ pub mod provider_quota;
 pub mod token_estimate;
 pub mod server;
 pub mod storage;
+pub mod trace;

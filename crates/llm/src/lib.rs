@@ -80,16 +80,29 @@ pub struct ImageUrl {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
+    /// Empty on CC stream argument-continuation deltas (only the first delta
+    /// of a call carries the id); omitted from serialized output when empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub id: String,
-    #[serde(rename = "type")]
+    /// Empty on CC stream continuation deltas; omitted when empty.
+    #[serde(rename = "type", default, skip_serializing_if = "String::is_empty")]
     pub kind: String,
+    /// CC-style stream delta position, distinguishing parallel tool calls.
+    /// Absent in non-stream messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<u32>,
+    #[serde(default)]
     pub function: FunctionCall,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FunctionCall {
+    /// Empty on stream argument deltas (name only appears on the first delta).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
-    /// JSON-encoded arguments string (OpenAI convention).
+    /// JSON-encoded arguments string (OpenAI convention); a delta fragment
+    /// when carried by a stream chunk.
+    #[serde(default)]
     pub arguments: String,
 }
 

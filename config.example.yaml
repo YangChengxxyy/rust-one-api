@@ -1,5 +1,5 @@
 # rust-one-api 配置示例。所有字段可用环境变量覆盖：
-# ROA_LISTEN / ROA_DATABASE_URL / ROA_ADMIN_TOKEN / ROA_TRACE_LEVEL；
+# ROA_LISTEN / ROA_DATABASE_URL / ROA_ADMIN_TOKEN / ROA_TRACE_LEVEL / ROA_LB_DEFAULT；
 # 配置文件路径用 CONFIG_FILE 指定。
 
 listen: "0.0.0.0:3000"
@@ -17,3 +17,10 @@ admin_token: "change-me"
 # | full（另存 headers/body，截断 16 KiB，authorization/x-api-key 脱敏）
 trace:
   level: "meta"
+
+# 实例级默认负载均衡策略：priority | round_robin | weighted_shuffle（默认）
+# | error_aware（数据源为 requests 表惰性聚合，trace.level=off 时无数据）
+# | sticky（x-session-id 头或请求体 user 字段固定渠道）。
+# 渠道可用 settings.lb_strategy 覆盖（取候选中最高 priority 渠道的设置）。
+lb:
+  default: "weighted_shuffle"

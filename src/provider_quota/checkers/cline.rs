@@ -1339,7 +1339,7 @@ mod tests {
         let mut ch = crate::storage::Channel {
             id: "1".into(), name: "c".into(), channel_type: "cline".into(), base_url: String::new(),
             credentials: String::new(), supported_models: String::new(), model_mapping: String::new(),
-            weight: 0, status: String::new(), settings: String::new(), created_at: String::new(), updated_at: String::new(),
+            weight: 0, priority: 0, status: String::new(), settings: String::new(), created_at: String::new(), updated_at: String::new(),
             disabled_api_keys: "[]".into(),
         };
         ch.supported_models = r#"["cline-pass/claude", "claude-sonnet-4"]"#.into();

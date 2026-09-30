@@ -34,7 +34,11 @@ struct AppState {
 pub async fn run(cfg: Config, pool: Db) -> anyhow::Result<()> {
     let http = reqwest::Client::new();
     let state = Arc::new(AppState {
-        relay: Relay::new(pool.clone(), TraceLevel::parse(&cfg.trace.level)),
+        relay: Relay::new(
+            pool.clone(),
+            TraceLevel::parse(&cfg.trace.level),
+            crate::lb::LbStrategy::parse_or_default(&cfg.lb.default),
+        ),
         pool,
         admin_token: cfg.admin_token.clone(),
         http,
@@ -147,11 +151,22 @@ async fn relay_openai(
         .await
         .map_err(|e| AppError::bad_request(format!("read body: {e}")))?;
     let api_key = authenticate(&state, &headers, None).await?;
+    let session = session_key_header(&headers);
     let outcome = state
         .relay
-        .relay("openai/chat_completions", None, false, &api_key, &body)
+        .relay("openai/chat_completions", None, false, &api_key, &body, session.as_deref())
         .await?;
     Ok(outcome_to_response(outcome))
+}
+
+/// Sticky-session key from `x-session-id`; only consulted when the resolved
+/// LB strategy is `sticky` (unified `user` field is the fallback).
+fn session_key_header(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Pure model aggregation: union of supported_models JSON arrays and
@@ -198,9 +213,10 @@ async fn relay_claude(
         .await
         .map_err(|e| AppError::bad_request(format!("read body: {e}")))?;
     let api_key = authenticate(&state, &headers, None).await?;
+    let session = session_key_header(&headers);
     let outcome = state
         .relay
-        .relay("claude/messages", None, false, &api_key, &body)
+        .relay("claude/messages", None, false, &api_key, &body, session.as_deref())
         .await?;
     Ok(outcome_to_response(outcome))
 }
@@ -214,9 +230,10 @@ async fn relay_responses(
         .await
         .map_err(|e| AppError::bad_request(format!("read body: {e}")))?;
     let api_key = authenticate(&state, &headers, None).await?;
+    let session = session_key_header(&headers);
     let outcome = state
         .relay
-        .relay("openai/responses", None, false, &api_key, &body)
+        .relay("openai/responses", None, false, &api_key, &body, session.as_deref())
         .await?;
     Ok(outcome_to_response(outcome))
 }
@@ -238,9 +255,10 @@ async fn relay_gemini(
         .await
         .map_err(|e| AppError::bad_request(format!("read body: {e}")))?;
     let api_key = authenticate(&state, &headers, query.get("key")).await?;
+    let session = session_key_header(&headers);
     let outcome = state
         .relay
-        .relay("gemini/models", Some(model), force_stream, &api_key, &body)
+        .relay("gemini/models", Some(model), force_stream, &api_key, &body, session.as_deref())
         .await?;
     Ok(outcome_to_response(outcome))
 }
@@ -279,7 +297,7 @@ fn channel_to_json(ch: &Channel) -> Value {
         "id": ch.id, "name": ch.name, "channel_type": ch.channel_type,
         "base_url": ch.base_url, "credentials": credentials_masked(ch),
         "supported_models": ch.supported_models, "model_mapping": ch.model_mapping,
-        "weight": ch.weight, "status": ch.status, "settings": ch.settings,
+        "weight": ch.weight, "priority": ch.priority, "status": ch.status, "settings": ch.settings,
         "created_at": ch.created_at, "updated_at": ch.updated_at,
     })
 }
@@ -315,8 +333,9 @@ async fn admin_create_channel(
             .unwrap_or_else(|| "[]".into()),
         model_mapping: body.get("model_mapping").map(|v| v.to_string()).unwrap_or_else(|| "{}".into()),
         weight: body.get("weight").and_then(|v| v.as_i64()).unwrap_or(0),
+        priority: body.get("priority").and_then(|v| v.as_i64()).unwrap_or(0),
         status: "enabled".into(),
-        settings: "{}".into(),
+        settings: body.get("settings").map(|v| v.to_string()).unwrap_or_else(|| "{}".into()),
         created_at: now.clone(),
         updated_at: now,
     };
@@ -369,6 +388,9 @@ async fn admin_update_channel(
     }
     if let Some(w) = body.get("weight").and_then(|v| v.as_i64()) {
         ch.weight = w;
+    }
+    if let Some(p) = body.get("priority").and_then(|v| v.as_i64()) {
+        ch.priority = p;
     }
     ch.updated_at = chrono::Utc::now().to_rfc3339();
     ChannelRepo::update(&state.pool, &ch).await?;
@@ -869,6 +891,7 @@ mod tests {
             supported_models: supported.into(),
             model_mapping: mapping.into(),
             weight: 1,
+            priority: 0,
             status: "enabled".into(),
             settings: "{}".into(),
             created_at: String::new(),

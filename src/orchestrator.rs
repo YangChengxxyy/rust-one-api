@@ -22,6 +22,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::error::AppError;
+use crate::lb;
 use crate::pricing::{self, ModelPrice};
 use chrono::Utc;
 use crate::keystate;
@@ -80,20 +81,24 @@ pub struct Relay {
     pool: Db,
     http: reqwest::Client,
     trace_level: TraceLevel,
+    lb_default: lb::LbStrategy,
 }
 
 impl Relay {
-    pub fn new(pool: Db, trace_level: TraceLevel) -> Self {
+    pub fn new(pool: Db, trace_level: TraceLevel, lb_default: lb::LbStrategy) -> Self {
         Self {
             pool,
             http: reqwest::Client::new(),
             trace_level,
+            lb_default,
         }
     }
 
     /// `model_hint` fills the unified request's model when the client body
     /// doesn't carry one (Gemini: the model lives in the URL path).
     /// `force_stream` forces `stream = true` (Gemini `:streamGenerateContent`).
+    /// `session_header` is the caller-supplied sticky-session key
+    /// (`x-session-id`); the unified `user` field is the fallback.
     pub async fn relay(
         &self,
         inbound_format: &str,
@@ -101,6 +106,7 @@ impl Relay {
         force_stream: bool,
         api_key: &ApiKey,
         body: &[u8],
+        session_header: Option<&str>,
     ) -> Result<RelayOutcome, AppError> {
         let inbound = create_inbound(inbound_format)
             .ok_or_else(|| AppError::bad_request(format!("unknown inbound format {inbound_format}")))?;
@@ -119,13 +125,13 @@ impl Relay {
 
         // Candidates: enabled + supporting the model, tiered by quota routing
         // evaluation (Open first, then no-data/unknown, sticky-only last).
-        let mut candidates =
+        let candidates =
             ChannelRepo::list_enabled_for_model(&self.pool, &requested_model).await?;
-        let mut tiered: Vec<(u8, Channel)> = Vec::with_capacity(candidates.len());
-        for ch in candidates.drain(..) {
+        let mut tiered: Vec<lb::Candidate> = Vec::with_capacity(candidates.len());
+        for ch in candidates {
             let rows = ProviderQuotaRepo::list_for_channel(&self.pool, &ch.id).await?;
             let Some(row) = rows.iter().find(|r| r.account_key.is_empty()) else {
-                tiered.push((1, ch));
+                tiered.push(lb::Candidate { tier: 1, channel: ch });
                 continue;
             };
             let data: Option<QuotaData> =
@@ -141,8 +147,10 @@ impl Relay {
             };
             match state {
                 routing::RoutingState::Exhausted => continue,
-                routing::RoutingState::Open => tiered.push((0, ch)),
-                routing::RoutingState::Unknown => tiered.push((1, ch)),
+                routing::RoutingState::Open => tiered.push(lb::Candidate { tier: 0, channel: ch }),
+                routing::RoutingState::Unknown => {
+                    tiered.push(lb::Candidate { tier: 1, channel: ch })
+                }
                 routing::RoutingState::StickyOnly => {
                     if let Some(r) = reason {
                         tracing::info!(
@@ -151,7 +159,7 @@ impl Relay {
                             "channel deprioritized to sticky-only"
                         );
                     }
-                    tiered.push((2, ch));
+                    tiered.push(lb::Candidate { tier: 2, channel: ch });
                 }
             }
         }
@@ -160,9 +168,41 @@ impl Relay {
                 "no channel available for model {requested_model}"
             )));
         }
-        tiered.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.weight.cmp(&a.1.weight)));
-        let mut candidates: Vec<Channel> = tiered.into_iter().map(|(_, ch)| ch).collect();
-        candidates.truncate(3);
+
+        // LB (Phase 3): the governing channel's settings.lb_strategy
+        // (highest priority wins) or the instance default decides the
+        // strategy; the pure pool orders candidates within quota tiers and
+        // the selector drives failover, folding in auto-disabled skips.
+        // Session pins only take effect under the sticky strategy.
+        let strategy = lb::resolve_strategy(&tiered, self.lb_default);
+        // Metrics are fetched ahead of the ordering context so `ctx` (a
+        // borrowed trait object) never lives across an `.await`.
+        if strategy == lb::LbStrategy::ErrorAware {
+            lb::maybe_refresh_metrics(&self.pool).await;
+        }
+        let metrics = (strategy == lb::LbStrategy::ErrorAware).then(lb::metrics_snapshot);
+        let mut rand = lb::thread_rand();
+        let mut ctx = lb::RouteCtx {
+            strategy,
+            metrics: metrics.as_ref(),
+            rr_offset: lb::next_rr_offset(),
+            rand: &mut rand,
+        };
+        lb::sort_candidates(&mut tiered, &mut ctx);
+        drop(ctx);
+        tiered.truncate(3);
+        let budget = tiered.len();
+        let billing_fallback = tiered.last().map(|c| c.channel.clone());
+        let session_key = if strategy == lb::LbStrategy::Sticky {
+            session_header
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| req.user.clone())
+        } else {
+            None
+        };
+        let mut selector = lb::LbSelector::new(std::mem::take(&mut tiered), session_key);
 
         let started = Instant::now();
         let mut tracer = RequestTracer::new(
@@ -172,16 +212,11 @@ impl Relay {
             req.stream,
         );
         let mut last_err = String::from("unknown error");
-        let mut skipped_disabled: Vec<String> = Vec::new();
-        for channel in &candidates {
-            // Process-local auto-disable layer (keystate); durable status
-            // filtering already happened in list_enabled_for_model.
-            if let Some(until) = keystate::channel_disabled_until(&channel.id) {
-                tracing::debug!(channel = %channel.id, until = %until, "skipping auto-disabled channel");
-                skipped_disabled.push(format!("{} (until {until})", channel.name));
-                continue;
-            }
-            let mut ch = channel.clone();
+        while let Some(candidate) = selector.next() {
+            // Process-local auto-disable layer (keystate) is folded into the
+            // selector's `next`; durable status filtering already happened
+            // in list_enabled_for_model.
+            let mut ch = candidate.channel;
             // OAuth channels: refresh first, then prefer the OAuth access
             // token over api_key/multi-key rotation (copilot exchanges its
             // GitHub token for a short-lived relay bearer).
@@ -206,6 +241,7 @@ impl Relay {
                         Err(e) => {
                             tracing::warn!(channel = %ch.id, "copilot token exchange failed: {e}");
                             last_err = format!("copilot token exchange failed: {e}");
+                            selector.rollback();
                             continue;
                         }
                     }
@@ -245,6 +281,7 @@ impl Relay {
                     Ok(outcome) => {
                         keystate::record_channel_success(&ch.id);
                         keystate::record_key_success(&ch.id, &key);
+                        selector.commit();
                         return Ok(outcome);
                     }
                     Err(f) => {
@@ -290,12 +327,16 @@ impl Relay {
                     }
                 }
             }
+            // Channel is done (all keys failed or a non-auth upstream
+            // failure): release any session pin so the next request
+            // re-picks, and move to the next candidate.
+            selector.rollback();
         }
         // All candidates failed: log once (last channel), then surface upstream error.
         let cost = write_billing(
             &self.pool,
             Some(api_key.id.as_str()),
-            candidates.last(),
+            billing_fallback.as_ref(),
             &requested_model,
             req.stream,
             &Usage::default(),
@@ -314,10 +355,11 @@ impl Relay {
                 cost,
             },
         );
-        if !skipped_disabled.is_empty() && skipped_disabled.len() == candidates.len() {
+        let skipped_disabled = selector.skipped_disabled();
+        if !skipped_disabled.is_empty() && skipped_disabled.len() == budget {
             return Err(AppError::not_found(format!(
                 "no channel available for model {requested_model}: all {} candidate(s) auto-disabled: {}",
-                candidates.len(),
+                budget,
                 skipped_disabled.join(", ")
             )));
         }
@@ -891,3 +933,4 @@ mod tests {
         assert!(!f(Some(429)).counts_as_channel_failure());
     }
 }
+

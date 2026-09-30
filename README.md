@@ -13,7 +13,8 @@ provider ◄── outbound transformer ◄── unified Response ◄──┘
 - `crates/llm` — 纯协议层（零业务依赖）：统一 `Request/Response/StreamChunk/Usage` 模型、`InboundTransformer`/`OutboundTransformer` trait、SSE 编解码、OpenAI / Responses / Anthropic / Gemini 四个 transformer。实例按请求创建（Anthropic 流式需要 content_block 状态机，Responses 流式需要 output_item 状态机）。
 - `src/storage` — sqlx Any（SQLite/PostgreSQL 双后端，URL scheme 决定 migrations 目录），TEXT uuid 主键 + RFC3339 时间戳 + JSON TEXT 列保证可移植。
 - `src/pricing` — 价格模型（flat_fee / usage_per_unit / usage_tiered 分段累进 / usage_volume 总量落档），rust_decimal 精确计算，cache/reasoning token 分摊规则见 `compute_cost` 文档。
-- `src/orchestrator` — 转发核心：配额预检 → 候选渠道（排除 exhausted）→ 权重排序 + 跨渠道重试（5xx/网络错误换道，4xx 直接透传）→ 模型重映射 → 计费落 usage_log。流式计费在独立 task 中完成，客户端断连不丢账。
+- `src/orchestrator` — 转发核心：配额预检 → 候选渠道（排除 exhausted）→ LB 排序与选择（见 `src/lb`）+ 跨渠道重试（5xx/网络错误换道，4xx 直接透传）→ 模型重映射 → 计费落 usage_log。流式计费在独立 task 中完成，客户端断连不丢账。
+- `src/lb` — 负载均衡（对照 axonhub `ChannelBalancer` 双层）：纯函数池 `sort_candidates`（候选 + 策略 + 上下文 → 有序候选，配额层 Open/Unknown/StickyOnly 恒优先于策略序）+ 每请求状态机 `LbSelector`（`next` 跳过熔断渠道并施加 sticky pin、`commit`/`rollback` 建立/释放 pin）。策略：`priority`（渠道 `priority` 列整组先试空再降级）、`round_robin`（游标轮转，渠道侧仅一个压缩计数器，key 轮仍在 keystate）、`weighted_shuffle`（ES 加权洗牌 u^(1/w)，默认）、`error_aware`（成功率/延迟 EMA，数据源为 requests 表惰性聚合：内存缓存 + 30s 定期刷新；`trace.level=off` 无数据时打分中性）、`sticky`（`x-session-id` 头或 unified `user` 字段固定渠道，pin 带 30 分钟 TTL 惰性清扫、上限 1 万条，失败即释放）。配置：渠道 `settings.lb_strategy` 优先（取最高 priority 渠道的设置），否则实例级 `lb.default`。
 - `src/trace` — 请求 trace（对照 axonhub `requests` + `request_executions`）：每逻辑请求一条概要（状态/模型/TTFT/总延迟/usage/成本），每次渠道尝试一条 execution（含请求/响应 headers 与 body）；响应完成后异步落库，不阻塞 respond 路径。`trace.level = off | meta | full`（默认 meta 不写 body；full 时 body 截断 16 KiB，`authorization`/`x-api-key` 脱敏为 `***`）。
 - `src/server` — axum 路由：relay 面 + admin 面。
 - `src/provider_quota` — 与 axonhub 对齐的配额检测：17 个厂商 checker（OAuth 类 claudecode/codex/github_copilot；API 类 apertis/charm_hyper/cline/commandcode/kimi_code/minimax/nanogpt/neuralwatt/ollama/opencode_go/synthetic/wafer/zenmux/zhipu/zai），统一 `QuotaData` 归一化（limits 去重合并、0.8/1.0 阈值、next_reset_at 汇总），period_cost 从 usage_logs 回填，60s 调度器并发 8 检查，exhausted 渠道被路由排除；无专用 checker 的渠道回落通用探活。
@@ -72,6 +73,7 @@ Admin（`Authorization: Bearer $ROA_ADMIN_TOKEN`）：`/admin/channels`、`/admi
 ## 数据约定
 
 - `channel_type` 即出站协议格式：`openai/chat_completions` | `openai/responses` | `claude/messages` | `gemini/models`。
+- `channel.priority`（整数，默认 0）：LB 分层，同层内再按所选策略排序；`channel.settings.lb_strategy` 可选：`priority` | `round_robin` | `weighted_shuffle` | `error_aware` | `sticky`，覆盖实例级 `lb.default`。sticky 会话键取 `x-session-id` 请求头，缺省回落请求体 `user` 字段。
 - `channel.credentials` = `{"api_key": "..."}`；`model_mapping` = `{"请求模型": "上游模型"}`。
 - `api_key.quota`（均可选，缺省不限）：`{"max_requests_per_day": N, "max_tokens_per_day": N, "max_cost_per_day": "1.5"}`，按 UTC 自然日聚合 usage_logs 判定。
 - 价格按 `(channel_id, model)` 精确匹配，无渠道专属价则回落全局价（`channel_id` 为空）；改价生成新 `reference_id` 供账单追溯。
@@ -84,5 +86,5 @@ Admin（`Authorization: Bearer $ROA_ADMIN_TOKEN`）：`/admin/channels`、`/admi
 ## 测试
 
 ```bash
-cargo test --workspace   # 302 项：llm 协议 44（含 Responses 13）+ storage/pricing/config/trace/server 等 258
+cargo test --workspace   # 317 项：llm 协议 44（含 Responses 13）+ storage/pricing/config/trace/lb/server 等 273
 ```

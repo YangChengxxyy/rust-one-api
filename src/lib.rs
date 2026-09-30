@@ -2,6 +2,7 @@ pub mod config;
 pub mod error;
 pub mod orchestrator;
 pub mod keystate;
+pub mod lb;
 pub mod oauth;
 pub mod pricing;
 pub mod pricing_seed;

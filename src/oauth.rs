@@ -846,6 +846,7 @@ mod tests {
             supported_models: String::new(),
             model_mapping: String::new(),
             weight: 1,
+            priority: 0,
             status: String::new(),
             settings: String::new(),
             created_at: String::new(),

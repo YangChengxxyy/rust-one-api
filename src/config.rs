@@ -12,6 +12,27 @@ pub struct Config {
     pub admin_token: Option<String>,
     #[serde(default)]
     pub trace: TraceConfig,
+    #[serde(default)]
+    pub lb: LbConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LbConfig {
+    /// Instance-level default LB strategy: priority | round_robin |
+    /// weighted_shuffle | error_aware | sticky. Channel
+    /// `settings.lb_strategy` overrides per channel.
+    #[serde(default = "default_lb_strategy")]
+    pub default: String,
+}
+
+impl Default for LbConfig {
+    fn default() -> Self {
+        Self { default: default_lb_strategy() }
+    }
+}
+
+fn default_lb_strategy() -> String {
+    "weighted_shuffle".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -68,6 +89,9 @@ impl Config {
         if let Ok(v) = std::env::var("ROA_TRACE_LEVEL") {
             cfg.trace.level = v;
         }
+        if let Ok(v) = std::env::var("ROA_LB_DEFAULT") {
+            cfg.lb.default = v;
+        }
         Ok(cfg)
     }
 }
@@ -90,5 +114,13 @@ mod tests {
     fn trace_level_parses_from_yaml() {
         let cfg: Config = serde_yaml::from_str("trace:\n  level: full").unwrap();
         assert_eq!(cfg.trace.level, "full");
+    }
+
+    #[test]
+    fn lb_default_falls_back_and_parses() {
+        let cfg: Config = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(cfg.lb.default, "weighted_shuffle");
+        let cfg: Config = serde_yaml::from_str("lb:\n  default: round_robin").unwrap();
+        assert_eq!(cfg.lb.default, "round_robin");
     }
 }

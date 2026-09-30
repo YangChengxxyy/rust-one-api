@@ -9,7 +9,7 @@
 |---|---|---|---|
 | Responses API | ✅ 已完成（2026-09-30） | `/v1/responses` + 与 messages/chat_completions 双向互转 | — |
 | Trace 落库 | ✅ 已完成（2026-09-30） | `requests` 概要 + `request_executions` 逐次执行（含 headers/body） | — |
-| LB 策略 | 单一：权重排序 + 5xx/换道（`provider_quota/routing.rs`） | round_robin / weighted_shuffle / error-aware（时延+成功率）/ sticky + priority 失败转移 + 实例级默认策略 | 策略框架 + 4 种策略 + 配置 |
+| LB 策略 | ✅ 已完成（2026-09-30） | round_robin / weighted_shuffle / error-aware（时延+成功率）/ sticky + priority 失败转移 + 实例级默认策略 | — |
 | 限流 | 无（Key 仅有日级配额，非速率） | 渠道 RPM burst（进程内）+ Key 日级配额（同我们） | 渠道速率限流全新 |
 | 管理前端 | 无，纯 JSON admin API | React 19 + TanStack + Tailwind，`features/` 14 个模块 | 全新独立工程 |
 
@@ -68,20 +68,25 @@ graph LR
 - 延迟粗测（本地 mock，各 30 请求）：trace=off p50=2.3ms / trace=full p50=2.3ms，无回归（写入不阻塞响应）。
 - 测试：302 项全绿（新增 trace 单测 6、TraceRepo 集成 1、config 解析 1）；README（架构/API/测试计数）与 `config.example.yaml`（`trace.level`）已更新。
 
-### Phase 3 — LB 策略分层 ◀ 下一步
+### Phase 3 — LB 策略分层 ✅ 已完成（2026-09-30）
 
-对照：axonhub `ChannelBalancer` 接口 = `ChannelPool`（channels+keys 无状态纯函数）+ `LbSelector`（有状态状态机，融合熔断态）；策略枚举 `round_robin | weighted_shuffle | error_aware(success/latency EMA) | sticky`，渠道带 `priority` 排序失败转移，另有实例级 `default_override_settings`（`internal/server/biz/channel_balancer*.go`、`channel.go:277-285`）。
+对照：axonhub `ChannelBalancer` 接口 = `ChannelPool`（channels+keys 无状态纯函数）+ `LbSelector`（有状态状态机，融合熔断态）；策略枚举 `round_robin | weighted_shuffle | error_aware(success/latency EMA) | sticky`，渠道带 `priority` 排序失败转移，另有实例级 `default_override_settings`（axonhub 现行实现在 `internal/orchestrator/lb_strategy_*.go`，双层语义不变）。
 
-- 重构 `src/provider_quota/routing.rs`：现「权重排序」固化为 `weighted_shuffle` 策略，按 axonhub 双层拆：
-  - `ChannelPool`：输入（渠道, 其 keys, 策略, 上下文）→ 排序后候选列表，纯函数可单测。
-  - `LbSelector`：持有 `KeyState`（已有）+ 新策略状态，`insert_candidates`/`next`/`commit`/`rollback` 接口；把现有 exhausted 排除 + 换道重试收敛进 `next`。
-- 新增策略：
-  1. `priority`：渠道表加 `priority INT NOT NULL DEFAULT 0`，高优先级整组先试空再降级（axonhub ordering policy 同语义）。
-  2. `round_robin`：channel+key 双枚举游标，状态压缩（仅存游标计数）。
-  3. `error_aware`：channel 时延/成功率 EMA 打分；数据源用 Phase 2 的 requests 表惰性聚合（内存缓存 + 定期刷新），不引入实时统计组件。
-  4. `sticky`：按请求会话键（`user` 字段或调用方显式 header）hash 固定渠道，TTL 惰性清理。**风险：selector 状态无限增长——axonhub 同坑，必须带 TTL 清扫。**
-- 配置：渠道级 `lb_strategy?`（缺省回落）+ 实例级 `config.yaml` `lb.default`；落一张小配置表或沿用 YAML 均可，倾向 YAML（现状无运行时配置表，避免为单设置建表）。
-- 验收：每个策略一组单测（候选顺序确定性，mock 固定随机源）；集成：3 渠道 priority 降级顺序、error_aware 在注入高延迟后切换偏好均可观测；全量回归 53 项基线外加新用例。
+- 落地：新模块 `src/lb.rs`——纯函数池 `sort_candidates`（Candidate{配额层, channel} + `RouteCtx{strategy, metrics, rr_offset, rand}` → 就地排序，配额层恒优先，策略只定层内序）+ 每请求 `LbSelector`（`insert_candidates` 经 new、`next`/`commit`/`rollback`；熔断渠道的跳过收敛进 `next` 并记录 skipped 供全灭时报错）。编排层 relay()：候选带层 → `resolve_strategy`（最高 priority 渠道的 `settings.lb_strategy`，否则实例默认）→ 池排序 → truncate(3) → selector 循环，成功 `commit`、换道 `rollback`。
+- 策略：
+  1. `priority`：迁移 `0005_channel_priority.sql`（sqlite/postgres 双份，`INT NOT NULL DEFAULT 0` + 索引）；层内 priority desc → weight desc → id asc。
+  2. `round_robin`：层内按 id 稳定序后 `rr_offset % len` 旋转，全局仅存一个 AtomicU64 游标（key 轮仍在 keystate）；生产每请求取一次游标，单测经 ctx 注入固定 offset。
+  3. `error_aware`：`requests` 表惰性聚合（10 分钟窗口，30s 刷新间隔，EMA α=0.3，空闲 30 分钟丢条目）；打分 `success_ema*100 - 25*ln(1+latency_s)`，无数据 0 分中性；`trace.level=off` 时全体中性。
+  4. `sticky`：会话键 `x-session-id` 头 → 回落 unified `user` 字段；pin 30 分钟 TTL + 惰性清扫 + 1 万上限（满时先清过期再逐最逼近过期），失败 `rollback` 立即释放——规避 roadmap 标注的无限增长坑。
+  5. `weighted_shuffle`（默认策略）：ES 加权洗牌 `u^(1/w)`（xorshift64* 内置 PRNG，正权重≈按权重比例首选，≤0 沉底）；是对旧「weight desc 确定性排序」的泛化——旧行为可视为其退化特例。
+- 配置：`config.yaml` `lb.default` + `ROA_LB_DEFAULT`（未知值告警回落 weighted_shuffle，同 `trace.level` 约定）；渠道 `settings.lb_strategy` 覆盖。
+- 设计要点：`RouteCtx` 全部输入显式注入（固定 rand/offset/metrics → 单测确定性）；ctx 的 rand 加 `Send` 约束且不跨 `.await`（否则 axum Handler future 失 Send）；sticky 仅 sticky 策略才解析会话键（其余策略不建 pin 不读 pin）。
+- 验收实测：
+  - 单测 +15（317 全绿）：各策略确定性序（ES 键手算序列、RR 逐层旋转）、resolve_strategy 治理规则、selector 跳熔断、pin 建立/提升/释放/TTL/容量清扫、migration 0005 往返、刷新集成（见下）。
+  - error_aware 集成（内存 sqlite）：等量健康时 id 序 → 注入 3 条 50s 延迟 requests 行刷新后翻转偏好，可断言。
+  - curl 冒烟（mock 上游 + trace executions 断言）：A. priority 3 渠道（prio 10 死端口 / 5 / 1）→ `[hi:failed, mid:success]`；B. round_robin 2 渠道 4 请求 → 渠道严格交替；C. sticky 全流程——req1 pin 重权重渠道、停掉该渠道后 req2 `[pinned:failed, 次优:success]` 且回滚释放 pin、恢复后 req3 仍走新 pin 渠道。
+  - 双后端：sqlite 全链路 + postgres（docker pg16）迁移/读写/单请求通过。
+- 行为变化（有意为之）：等权重多渠道默认策略下首选不再是 created_at 稳定序而是按权重等比随机——weighted_shuffle 的本义；同权重 tie 现给随机分布，单渠道/单候选不受影响。
 
 ### Phase 4 — 限流
 

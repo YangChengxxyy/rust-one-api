@@ -78,6 +78,9 @@ pub struct Channel {
     pub supported_models: String,
     pub model_mapping: String,
     pub weight: i64,
+    /// LB priority tier (Phase 3): higher tiers are exhausted before the
+    /// selector degrades to the next one. 0 = lowest.
+    pub priority: i64,
     pub status: String,
     pub settings: String,
     pub created_at: String,
@@ -185,7 +188,7 @@ macro_rules! impl_from_row {
     };
 }
 
-impl_from_row!(Channel { id, name, channel_type, base_url, credentials, disabled_api_keys, supported_models, model_mapping, weight, status, settings, created_at, updated_at });
+impl_from_row!(Channel { id, name, channel_type, base_url, credentials, disabled_api_keys, supported_models, model_mapping, weight, priority, status, settings, created_at, updated_at });
 impl_from_row!(ApiKey { id, key, name, status, quota, expired_at, created_at, updated_at });
 impl_from_row!(ModelPrice { id, channel_id, model, price, reference_id, created_at, updated_at });
 // UsageLog: sqlite stores stream as INTEGER (BIGINT kind to the Any driver),
@@ -247,8 +250,8 @@ pub struct ChannelRepo;
 impl ChannelRepo {
     pub async fn insert(pool: &AnyPool, ch: &Channel) -> Result<()> {
         sqlx::query(
-            "INSERT INTO channels (id, name, channel_type, base_url, credentials, disabled_api_keys, supported_models, model_mapping, weight, status, settings, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+            "INSERT INTO channels (id, name, channel_type, base_url, credentials, disabled_api_keys, supported_models, model_mapping, weight, priority, status, settings, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
         )
         .bind(&ch.id)
         .bind(&ch.name)
@@ -259,6 +262,7 @@ impl ChannelRepo {
         .bind(&ch.supported_models)
         .bind(&ch.model_mapping)
         .bind(ch.weight)
+        .bind(ch.priority)
         .bind(&ch.status)
         .bind(&ch.settings)
         .bind(&ch.created_at)
@@ -270,7 +274,7 @@ impl ChannelRepo {
 
     pub async fn update(pool: &AnyPool, ch: &Channel) -> Result<()> {
         sqlx::query(
-            "UPDATE channels SET name = $1, channel_type = $2, base_url = $3, credentials = $4, disabled_api_keys = $5, supported_models = $6, model_mapping = $7, weight = $8, status = $9, settings = $10, updated_at = $11 WHERE id = $12",
+            "UPDATE channels SET name = $1, channel_type = $2, base_url = $3, credentials = $4, disabled_api_keys = $5, supported_models = $6, model_mapping = $7, weight = $8, priority = $9, status = $10, settings = $11, updated_at = $12 WHERE id = $13",
         )
         .bind(&ch.name)
         .bind(&ch.channel_type)
@@ -280,6 +284,7 @@ impl ChannelRepo {
         .bind(&ch.supported_models)
         .bind(&ch.model_mapping)
         .bind(ch.weight)
+        .bind(ch.priority)
         .bind(&ch.status)
         .bind(&ch.settings)
         .bind(&ch.updated_at)
@@ -643,6 +648,32 @@ impl TraceRepo {
         Ok(())
     }
 
+    /// (channel_id, status, latency_ms) for requests logged at/after `since`
+    /// (rfc3339, lexicographic). Feeds the Phase 3 error-aware EMA; rows
+    /// without a final channel (all-candidates-failed) carry no signal and
+    /// are skipped.
+    pub async fn channel_activity_since(
+        pool: &AnyPool,
+        since: &str,
+    ) -> Result<Vec<(String, String, i64)>> {
+        let rows = sqlx::query(
+            "SELECT channel_id, status, latency_ms FROM requests WHERE created_at >= $1 AND channel_id IS NOT NULL",
+        )
+        .bind(since)
+        .fetch_all(pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    r.try_get::<String, _>("channel_id").unwrap_or_default(),
+                    r.try_get::<String, _>("status").unwrap_or_default(),
+                    r.try_get::<i64, _>("latency_ms").unwrap_or_default(),
+                )
+            })
+            .collect())
+    }
+
     pub async fn list_filtered(pool: &AnyPool, f: &TraceFilter) -> Result<Vec<TraceRequest>> {
         // $n placeholders: portable across postgres (native) and sqlite ($name form).
         let mut sql = String::from("SELECT * FROM requests WHERE 1=1");
@@ -798,6 +829,7 @@ mod tests {
             supported_models: supported.into(),
             model_mapping: mapping.into(),
             weight: 1,
+            priority: 0,
             status: status.into(),
             settings: "{}".into(),
             created_at: ts.clone(),
